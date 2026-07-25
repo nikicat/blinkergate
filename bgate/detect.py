@@ -70,6 +70,7 @@ class Detection:
         self.eyes = eyes                # {side: Eye}
         self.landmarks = landmarks      # mesh landmarks, when the source has them
         self.box = box
+        self.roll = roll_of(eyes) or 0.0
 
     def __bool__(self):
         return bool(self.eyes)

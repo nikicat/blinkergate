@@ -116,7 +116,7 @@ class Registry:
             "counts": counts,
             "crop": {"pad_w": data.PAD_W, "pad_h": data.PAD_H,
                      "in_h": data.IN_H, "in_w": data.IN_W, "blur": blur,
-                     "normalise": normalise},
+                     "normalise": normalise, "roll_levelled": True},
             "crops_sha256": crops_hash(samples),
             "versions": _versions(),
         }

@@ -241,7 +241,7 @@ class App:
 
         if det and self.model:
             lm = det.landmarks
-            probs, _crops, boxes = self.model.eyes(gray, lm)
+            probs, _crops, boxes = self.model.eyes(gray, lm, roll=det.roll)
             shut = [p is not None and p < self.args.thresh for p in probs]
             for box, is_shut in zip(boxes, shut):
                 x0, y0, x1, y1 = [int(v * ui.S) for v in box]

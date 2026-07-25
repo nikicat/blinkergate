@@ -19,6 +19,7 @@ labels it was trained on.
 """
 
 import csv
+import math
 import os
 import time
 
@@ -79,31 +80,67 @@ def ensure(ds_dir):
     os.makedirs(frames_dir(ds_dir), exist_ok=True)
 
 
-def crop_at(gray, cx, cy, eye_width, pad_w=PAD_W, pad_h=PAD_H):
-    """The crop, given only where the eye is and how wide it is.
+def crop_at(gray, cx, cy, eye_width, pad_w=PAD_W, pad_h=PAD_H, roll=0.0):
+    """The crop, given only where the eye is, how wide it is, and its tilt.
 
     This is the single definition of the geometry: any detector that can supply a
     centre and a width produces crops the model recognises, which is what lets a
     second detector stand in for the one the model was trained with.
+
+    ``roll`` levels the eye. Locating a tilted eye correctly is not enough - an
+    axis-aligned rectangle around it still contains a *rotated* eye, and every
+    training crop holds a near-upright one. Passing the head roll cuts the crop in
+    the levelled frame instead, so tilt stops being a variable the classifier has
+    to have seen. roll=0 reproduces the plain rectangle exactly.
     """
     h, w = gray.shape[:2]
     half_w = max(eye_width * pad_w / 2, 8)
     half_h = half_w * (IN_H / IN_W) * pad_h
-    x0, y0 = max(0, int(cx - half_w)), max(0, int(cy - half_h))
-    x1, y1 = min(w, int(cx + half_w)), min(h, int(cy + half_h))
+    box = (max(0, int(cx - half_w)), max(0, int(cy - half_h)),
+           min(w, int(cx + half_w)), min(h, int(cy + half_h)))
+
+    if roll:
+        # One warp straight to the output size: rotate about the eye, scale so the
+        # crop width maps to IN_W, then put the eye at the centre of the output.
+        m = cv2.getRotationMatrix2D((cx, cy), roll, IN_W / (2 * half_w))
+        m[0, 2] += IN_W / 2 - cx
+        m[1, 2] += IN_H / 2 - cy
+        crop = cv2.warpAffine(gray, m, (IN_W, IN_H), flags=cv2.INTER_AREA,
+                              borderMode=cv2.BORDER_REPLICATE)
+        return crop, box
+
+    x0, y0, x1, y1 = box
     if x1 <= x0 + 2 or y1 <= y0 + 2:
-        return None, (x0, y0, x1, y1)
+        return None, box
     crop = cv2.resize(gray[y0:y1, x0:x1], (IN_W, IN_H), interpolation=cv2.INTER_AREA)
-    return crop, (x0, y0, x1, y1)
+    return crop, box
 
 
-def make_crop(gray, lm, ring, pad_w=PAD_W, pad_h=PAD_H):
-    """Eye crop from mesh landmarks. Landmarks locate the eye reliably on infrared
-    even where they track eyelid *shape* poorly, so position is all this asks."""
-    h, w = gray.shape[:2]
+def eye_centre(lm, ring, w, h):
     pts = np.array([[lm[i].x * w, lm[i].y * h] for i in ring])
-    return crop_at(gray, pts[:, 0].mean(), pts[:, 1].mean(),
-                   pts[:, 0].max() - pts[:, 0].min(), pad_w, pad_h)
+    return (pts[:, 0].mean(), pts[:, 1].mean(), pts[:, 0].max() - pts[:, 0].min())
+
+
+def roll_from(lm, w, h):
+    """Head roll in degrees, from the line joining the two eye centres."""
+    lx, ly, _ = eye_centre(lm, SIDES[0][1], w, h)
+    rx, ry, _ = eye_centre(lm, SIDES[1][1], w, h)
+    return math.degrees(math.atan2(ly - ry, lx - rx))
+
+
+def make_crop(gray, lm, ring, pad_w=PAD_W, pad_h=PAD_H, roll=None):
+    """Eye crop from mesh landmarks. Landmarks locate the eye reliably on infrared
+    even where they track eyelid *shape* poorly, so position is all this asks.
+
+    Roll is taken from the landmarks unless given, so the crop is levelled by
+    default: a correctly located but tilted eye still breaks the classifier
+    (measured 56.9% at 30 degrees against 98.3% levelled).
+    """
+    h, w = gray.shape[:2]
+    cx, cy, width = eye_centre(lm, ring, w, h)
+    if roll is None:
+        roll = roll_from(lm, w, h)
+    return crop_at(gray, cx, cy, width, pad_w, pad_h, roll)
 
 
 def _migrate_legacy(ds_dir):
@@ -196,6 +233,8 @@ class Dataset:
                 # Older caches predate stored geometry; without it we cannot
                 # re-crop for jitter, so rebuild rather than silently skip it.
                 geoms = z["geom"]
+                if geoms.shape[1] < 4:
+                    raise ValueError("cache predates roll-levelled crops")
                 cached = {str(n): crops[i] for i, n in enumerate(names)}
                 geom = {str(n): geoms[i] for i, n in enumerate(names)}
             except Exception:
@@ -220,15 +259,14 @@ class Dataset:
                     continue
                 lm = res.face_landmarks[0]
                 gh, gw = g.shape[:2]
+                roll = roll_from(lm, gw, gh)
                 for side, ring, _tag in SIDES:
-                    pts = np.array([[lm[i].x * gw, lm[i].y * gh] for i in ring])
-                    cx, cy = pts[:, 0].mean(), pts[:, 1].mean()
-                    width = pts[:, 0].max() - pts[:, 0].min()
-                    crop, _box = crop_at(g, cx, cy, width)
+                    cx, cy, width = eye_centre(lm, ring, gw, gh)
+                    crop, _box = crop_at(g, cx, cy, width, roll=roll)
                     if crop is not None:
                         sid = sample_id(frame, side)
                         cached[sid] = crop
-                        geom[sid] = np.array([cx, cy, width], dtype=np.float32)
+                        geom[sid] = np.array([cx, cy, width, roll], dtype=np.float32)
                 if progress and i % 10 == 0:
                     progress(i, len(missing_frames))
             self._save_crops(cached, geom)
@@ -303,15 +341,14 @@ class Dataset:
 
         if lm is not None:
             h, w = gray.shape[:2]
+            roll = roll_from(lm, w, h)
             for side, ring, _tag in SIDES:
-                pts = np.array([[lm[i].x * w, lm[i].y * h] for i in ring])
-                cx, cy = pts[:, 0].mean(), pts[:, 1].mean()
-                width = pts[:, 0].max() - pts[:, 0].min()
-                crop, _box = crop_at(gray, cx, cy, width)
+                cx, cy, width = eye_centre(lm, ring, w, h)
+                crop, _box = crop_at(gray, cx, cy, width, roll=roll)
                 if crop is not None:
                     sid = sample_id(frame, side)
                     self.crops[sid] = crop
-                    self.geom[sid] = np.array([cx, cy, width], dtype=np.float32)
+                    self.geom[sid] = np.array([cx, cy, width, roll], dtype=np.float32)
             self.flush()
         return frame
 
@@ -386,11 +423,12 @@ class Dataset:
             if gray is None:
                 continue
             for s in group:
-                cx, cy, width = (float(v) for v in s["geom"])
+                cx, cy, width, roll = (float(v) for v in s["geom"])
                 for _ in range(copies):
                     dx, dy = rng.uniform(-JITTER_PX, JITTER_PX, 2)
                     scale = 1.0 + rng.uniform(-JITTER_SCALE, JITTER_SCALE)
-                    crop, _box = crop_at(gray, cx + dx, cy + dy, width * scale)
+                    crop, _box = crop_at(gray, cx + dx, cy + dy, width * scale,
+                                         roll=roll)
                     if crop is not None:
                         out.append(dict(id=s["id"], frame=frame, side=s["side"],
                                         label=s["label"], burst=s["burst"],

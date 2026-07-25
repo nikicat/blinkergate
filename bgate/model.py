@@ -212,11 +212,18 @@ class EyeModel:
             out.append(float(next(probs)) if c is not None else None)
         return out
 
-    def eyes(self, gray, lm):
-        """P(open) and crop box for both eyes, from mesh landmarks."""
+    def eyes(self, gray, lm, roll=None):
+        """P(open) and crop box for both eyes, from mesh landmarks.
+
+        The crop is levelled using the head roll, because locating a tilted eye
+        is not the same as being able to classify it.
+        """
+        h, w = gray.shape[:2]
+        if roll is None:
+            roll = data.roll_from(lm, w, h)
         crops, boxes = [], []
         for _side, ring, _tag in data.SIDES:
-            crop, box = data.make_crop(gray, lm, ring)
+            crop, box = data.make_crop(gray, lm, ring, roll=roll)
             crops.append(crop)
             boxes.append(box)
         return self.predict(crops), crops, boxes
@@ -232,7 +239,8 @@ class EyeModel:
             eye = detection.eyes.get(side)
             if eye is None:
                 continue
-            crop, box = data.crop_at(gray, eye.cx, eye.cy, eye.width)
+            crop, box = data.crop_at(gray, eye.cx, eye.cy, eye.width,
+                                     roll=getattr(detection, "roll", 0.0) or 0.0)
             sides.append(side)
             crops.append(crop)
             boxes.append(box)
