@@ -113,7 +113,13 @@ def create_app(ds_dir="dataset", models_dir="models"):
             unseen = state.registry.unseen_by(meta["id"], current)
             meta["n_unseen"] = len(unseen)
             meta["unseen_accuracy"] = None
-            if unseen:
+            # Today's crops are cut to today's convention. A generation fitted on
+            # another one would be scored on input it was never fitted for, and
+            # the resulting number would look like a bad model rather than a
+            # meaningless comparison. Say so instead of printing it.
+            meta["stale_convention"] = (meta.get("crop", {}).get("convention")
+                                        != data.CROP_CONVENTION)
+            if unseen and not meta["stale_convention"]:
                 try:
                     model = state.registry.load(meta["id"])
                     p = model.p_closed([s["crop"] for s in unseen])

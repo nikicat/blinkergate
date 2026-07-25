@@ -10,6 +10,12 @@ detection layer that has to work first.
 
 ![modes](docs/modes.svg)
 
+> **Before changing anything here, read [docs/FINDINGS.md](docs/FINDINGS.md) and
+> [docs/PITFALLS.md](docs/PITFALLS.md).** The first is what has been measured on
+> this hardware — frame rate, detector thresholds, what the classifier is brittle
+> to. The second is the mistakes that produced confident wrong answers along the
+> way, most of which are easy to repeat.
+
 ## Why enrol instead of shipping a model
 
 Off-the-shelf infrared eye-state models exist and are good. On this hardware they
@@ -150,9 +156,31 @@ yourself a working detector is broken.
 
 ## Status
 
-Detection is solved and enrolment works. Not yet measured: the false-positive
-rate during ordinary blinking, which is what decides whether this can gate
-privilege escalation. That needs a passive recording rather than posed captures.
+Detection finds 100% of the frames captured because it was struggling, and
+enrolment works.
+
+That 100% is a detection *rate*, and it turned out to be hiding the next problem:
+finding a face and locating the eyes inside it are different jobs, and a rate can
+only see the first. On a rolled head the mesh keeps finding the face and puts the
+eyes in the wrong place — enough to cost 24 points of accuracy at 35° of tilt.
+`roll_sweep.py` measures it, by rotating a labelled frame so the true eye position
+is known exactly:
+
+| roll | before | after |
+|---|---|---|
+| −35° | 60.9% | **84.4%** |
+| 0° | 94.2% | **95.4%** |
+| +35° | 69.7% | **86.7%** |
+
+Not yet measured: the **false-positive rate during ordinary blinking**, which is
+what decides whether this can gate privilege escalation, and which posed captures
+cannot produce — it needs a passive recording while the camera is ignored. Every
+accuracy figure here is conditioned on a deliberate pose.
+
+Ambient infrared is the outer limit rather than anything in the software: above
+roughly the level where frame contrast falls to a quarter of normal, the
+retroreflection stops standing out from skin. `ambient_test.py` measures whether
+subtracting the unlit strobe frame recovers it; that is implemented and untested.
 
 Related: [Howdy](https://github.com/boltgolt/howdy) (face auth for Linux, dormant
 since mid-2025, has a rubberstamp plugin hook this could target) and

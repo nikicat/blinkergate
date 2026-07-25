@@ -18,15 +18,28 @@ over with crops the model still recognises.
 
 That calibration is learned online rather than hardcoded, because it depends on
 the camera and on where you sit.
+
+Finding a face and locating the eyes inside it are separate jobs here, and the
+classes split along that line. :class:`Cascade` and :class:`RollTracker` exist to
+stop a frame being lost; :class:`LevelRefit` exists because a frame that was not
+lost can still be located badly, which a detection rate cannot see and which cost
+24 points of accuracy on a rolled head. :func:`default_locator` assembles the
+stack, and is the one place it is assembled.
 """
 
 import math
+import os
 from collections import deque
 
 import cv2
 import numpy as np
 
-from . import ui
+from . import data, ui
+
+# OpenCV's YuNet, fetched by fetch_model.py. Optional: without it the cascade is
+# the roll-compensated mesh alone.
+YUNET_MODEL = "face_detection_yunet.onnx"
+YUNET_SIZE = (640, 360)
 
 # MediaPipe eye rings, keyed by the side names the dataset uses. The names are
 # historical and misleading: "img_left" is the SUBJECT'S left eye, which on an
@@ -76,6 +89,17 @@ class Detection:
         return bool(self.eyes)
 
 
+def mesh_eyes(lm, w, h):
+    """Eye centres and widths from mesh landmarks.
+
+    Defers to :func:`bgate.data.eye_geometry` so a detector and the crop cache
+    cannot disagree about what an eye width is. They did: this measured the width
+    of an axis-aligned box, which shrinks as the head rolls.
+    """
+    eyes, _roll = data.eye_geometry(lm, w, h)
+    return {side: Eye(*geo) for side, geo in eyes.items()}
+
+
 class MediaPipeLocator:
     """The mesh. Also the only source of eyelid contours, which the UI draws."""
 
@@ -97,12 +121,7 @@ class MediaPipeLocator:
             return None
         lm = res.face_landmarks[0]
         h, w = gray.shape[:2]
-        eyes = {}
-        for side, ring in RINGS.items():
-            pts = np.array([[lm[i].x * w, lm[i].y * h] for i in ring])
-            eyes[side] = Eye(pts[:, 0].mean(), pts[:, 1].mean(),
-                             pts[:, 0].max() - pts[:, 0].min())
-        return Detection(self.name, eyes, landmarks=lm)
+        return Detection(self.name, mesh_eyes(lm, w, h), landmarks=lm)
 
 
 class YuNetLocator:
@@ -249,11 +268,121 @@ def roll_of(eyes):
     return math.degrees(math.atan2(b.cy - a.cy, b.cx - a.cx))
 
 
+def rotate_frame(gray, angle):
+    """The frame rotated about its centre, and the matrix that did it."""
+    h, w = gray.shape[:2]
+    m = cv2.getRotationMatrix2D((w / 2, h / 2), angle, 1.0)
+    return cv2.warpAffine(gray, m, (w, h), flags=cv2.INTER_LINEAR,
+                          borderMode=cv2.BORDER_REPLICATE), m
+
+
+def unrotate(det, m, shape):
+    """Map a detection made on a rotated image back to the original."""
+    h, w = shape[:2]
+    inv = cv2.invertAffineTransform(m)
+    eyes = {}
+    for side, eye in det.eyes.items():
+        eyes[side] = Eye(inv[0, 0] * eye.cx + inv[0, 1] * eye.cy + inv[0, 2],
+                         inv[1, 0] * eye.cx + inv[1, 1] * eye.cy + inv[1, 2],
+                         eye.width)          # rotation does not change scale
+    landmarks = det.landmarks
+    if landmarks is not None:
+        pts = np.array([[l.x * w, l.y * h, 1.0] for l in landmarks])
+        mapped = pts @ inv.T
+        landmarks = [_Landmark(px / w, py / h, l.z)
+                     for (px, py), l in zip(mapped, landmarks)]
+    return Detection(det.source, eyes, landmarks=landmarks, box=det.box)
+
+
+class LevelRefit:
+    """Wraps a locator and re-fits the face once with its roll cancelled.
+
+    Finding the face is not the same as locating the eyes *within* it. The mesh
+    will happily fit a tilted head - detection rate stays 100% - but it fits it
+    badly, and every error lands on a classifier that is a template matcher with a
+    cliff at 4px. Measured by `roll_sweep.py`, which rotates labelled frames by a
+    known angle so the true eye position is exactly known, and scores with capture
+    bursts held out:
+
+        roll            -35    -20      0     20     35
+        as found      60.9%  80.4%  94.2%  78.2%  69.7%
+        + refit       76.7%  93.1%  95.4%  88.5%  77.7%
+        + levelled w  84.4%  94.6%  95.4%  89.4%  86.7%
+
+    The first fit is made on the frame as it arrived, so the angle it measures
+    cannot have been suggested by a rotation we applied. That is the entire safety
+    argument for doing this at all, and it is why the rotation is always computed
+    from that first fit and never from the refit.
+
+    Iterating is where it turns dangerous. The obvious second pass - measure the
+    roll again, add it to the angle already applied - double counts, because a
+    detection mapped back into the original frame reports the *absolute* roll and
+    not what is left of it. Written that way it invented 48.5 degrees on a face
+    rolled 33.7, and mean eye error at 35 degrees went to 9.2px against 3.9px for
+    not refitting at all: the RollTracker feedback loop again, one class down.
+    """
+
+    name = "level-refit"
+    # Below this the correction is not worth a warpAffine plus a second mesh pass;
+    # measured roll on a level head wanders a degree or two frame to frame.
+    DEADZONE = 3.0
+    # A refit that moves an eye further than this, as a fraction of eye width, has
+    # not refined the same face - keep the fit that was not built on a guess.
+    MAX_MOVE = 1.0
+
+    def __init__(self, locator):
+        self.locator = locator
+        self.refits = 0
+        self.rejected = 0
+
+    def locate(self, gray):
+        det = self.locator.locate(gray)
+        if not det:
+            return None
+        roll = roll_of(det.eyes)
+        if roll is None or abs(roll) < self.DEADZONE:
+            return det
+
+        rotated, m = rotate_frame(gray, roll)
+        got = self.locator.locate(rotated)
+        if not got:
+            return det
+        refit = unrotate(got, m, gray.shape)
+        if self._moved_too_far(det, refit):
+            self.rejected += 1
+            return det
+        self.refits += 1
+        return refit
+
+    def _moved_too_far(self, det, refit):
+        for side, before in det.eyes.items():
+            after = refit.eyes.get(side)
+            if after is None:
+                return True
+            if math.hypot(after.cx - before.cx, after.cy - before.cy) > \
+                    self.MAX_MOVE * max(before.width, 1.0):
+                return True
+        return False
+
+    @property
+    def angle(self):
+        return getattr(self.locator, "angle", 0.0)
+
+    @property
+    def used(self):
+        return getattr(self.locator, "used", None)
+
+
 class RollTracker:
-    """Wraps a locator and cancels head roll before asking it to detect.
+    """Wraps a locator and cancels head roll before asking it to *find* a face.
 
     Face detectors are trained on upright faces. Measured on 43 frames where
     detection was struggling, rotating to upright took MediaPipe from 67% to 93%.
+
+    Only the frames where detection fails outright reach the rotated candidates,
+    so this does nothing for a tilted face that was found anyway - badly. That is
+    :class:`LevelRefit`'s job, and the two are deliberately separate: this one is
+    allowed to fail, and the refit is only allowed to improve.
 
     The angle is *tracked*, not swept: once the head is found at some roll, the
     next frame almost certainly has a similar one, so the usual cost is a single
@@ -295,36 +424,6 @@ class RollTracker:
                 out.append(angle)
         return out
 
-    @staticmethod
-    def _rotate(gray, angle):
-        h, w = gray.shape[:2]
-        m = cv2.getRotationMatrix2D((w / 2, h / 2), angle, 1.0)
-        return cv2.warpAffine(gray, m, (w, h), flags=cv2.INTER_LINEAR,
-                              borderMode=cv2.BORDER_REPLICATE), m
-
-    @staticmethod
-    def _unrotate(det, m, shape):
-        """Map a detection made on the rotated image back to the original."""
-        h, w = shape[:2]
-        inv = cv2.invertAffineTransform(m)
-
-        def back(px, py):
-            return (inv[0, 0] * px + inv[0, 1] * py + inv[0, 2],
-                    inv[1, 0] * px + inv[1, 1] * py + inv[1, 2])
-
-        eyes = {}
-        for side, eye in det.eyes.items():
-            x, y = back(eye.cx, eye.cy)
-            eyes[side] = Eye(x, y, eye.width)      # rotation does not change scale
-
-        landmarks = det.landmarks
-        if landmarks is not None:
-            pts = np.array([[l.x * w, l.y * h, 1.0] for l in landmarks])
-            mapped = pts @ inv.T
-            landmarks = [_Landmark(px / w, py / h, l.z)
-                         for (px, py), l in zip(mapped, landmarks)]
-        return Detection(det.source, eyes, landmarks=landmarks, box=det.box)
-
     def locate(self, gray):
         for angle in self._candidates():
             if angle == 0.0:
@@ -337,10 +436,10 @@ class RollTracker:
                     return det
                 continue
 
-            rotated, m = self._rotate(gray, angle)
+            rotated, m = rotate_frame(gray, angle)
             det = self.locator.locate(rotated)
             if det:
-                det = self._unrotate(det, m, gray.shape)
+                det = unrotate(det, m, gray.shape)
                 self.last_used = angle
                 measured = roll_of(det.eyes)
                 # Track what the face actually is, not the angle that happened to
@@ -404,12 +503,8 @@ class BoxedMeshLocator:
         landmarks = [_Landmark((x0 + l.x * rw / scale) / w,
                                (y0 + l.y * rh / scale) / h, l.z)
                      for l in det.landmarks]
-        eyes = {}
-        for side, ring in RINGS.items():
-            pts = np.array([[landmarks[i].x * w, landmarks[i].y * h] for i in ring])
-            eyes[side] = Eye(pts[:, 0].mean(), pts[:, 1].mean(),
-                             pts[:, 0].max() - pts[:, 0].min())
-        return Detection(self.name, eyes, landmarks=landmarks, box=proposal.box)
+        return Detection(self.name, mesh_eyes(landmarks, w, h),
+                         landmarks=landmarks, box=proposal.box)
 
 
 class Cascade:
@@ -443,3 +538,36 @@ class Cascade:
             if isinstance(loc, RollTracker):
                 return loc.angle
         return 0.0
+
+
+def default_locator(landmarker=None, yunet_path=YUNET_MODEL, warn=None):
+    """The locator stack, in one place, because two places is one convention too
+    many.
+
+    The live view runs this to find eyes. The crop cache runs it to build the
+    training crops. Those have to be the same stack, and were not: the cache
+    rebuilt crops with a bare mesh call, so a frame that only the roll rescue or
+    the YuNet box could locate got no crop at all, and its labels dropped out of
+    training. Materialised on one rebuild that was 32 samples across 14 capture
+    bursts, and it is invisible - a smaller training set does not look like an
+    error, it looks like a smaller training set.
+
+    ``warn`` is called with a message when the YuNet model is missing, so a
+    caller with somewhere to print can say so and one without can stay quiet.
+    """
+    from .model import make_landmarker
+    mesh = MediaPipeLocator(landmarker or make_landmarker())
+    # Two locators, tried in order, because they fail in different places.
+    # Roll-compensated mesh handles a tilted head (72% of the hard frames); YuNet
+    # finds the face in dark low-contrast ones the mesh drops, and the mesh then
+    # runs inside its box so the landmarks - and so the crop convention - stay the
+    # mesh's own. Together 77%, against 49% for the plain mesh.
+    stages = [RollTracker(MediaPipeLocator(make_landmarker()))]
+    if os.path.exists(yunet_path):
+        stages.append(BoxedMeshLocator(YuNetLocator(yunet_path, YUNET_SIZE), mesh))
+    elif warn:
+        warn(f"{yunet_path} missing - run: uv run fetch_model.py")
+    # LevelRefit wraps the whole cascade rather than sitting inside a stage:
+    # whichever locator found the face, the eyes inside it are still worth
+    # re-fitting with the roll cancelled.
+    return LevelRefit(Cascade(stages))

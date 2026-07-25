@@ -99,7 +99,8 @@ class Registry:
         normalise = NORMALISE if normalise is None else normalise
         np.savez(self.path(gen, "model.npz"), coef=coef, intercept=intercept,
                  in_h=data.IN_H, in_w=data.IN_W, blur=blur, normalise=normalise,
-                 pad_w=data.PAD_W, pad_h=data.PAD_H, cv_accuracy=accuracy)
+                 pad_w=data.PAD_W, pad_h=data.PAD_H, level_width=True,
+                 cv_accuracy=accuracy)
 
         with open(self.path(gen, "dataset.csv"), "w", newline="") as fh:
             w = csv.DictWriter(fh, fieldnames=data.FIELDS)
@@ -116,7 +117,8 @@ class Registry:
             "counts": counts,
             "crop": {"pad_w": data.PAD_W, "pad_h": data.PAD_H,
                      "in_h": data.IN_H, "in_w": data.IN_W, "blur": blur,
-                     "normalise": normalise, "roll_levelled": True},
+                     "normalise": normalise, "roll_levelled": True,
+                     "convention": data.CROP_CONVENTION},
             "crops_sha256": crops_hash(samples),
             "versions": _versions(),
         }

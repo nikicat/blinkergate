@@ -33,6 +33,11 @@ from . import ui
 PAD_W, PAD_H = 1.6, 1.0
 IN_H, IN_W = 24, 40
 
+# How a crop is derived from landmarks, as a single string. Stamped into the crop
+# cache and into every model generation: crops built one way are not crops built
+# the other way, and the difference is invisible in a 40x24 thumbnail.
+CROP_CONVENTION = "roll-levelled/level-width"
+
 # (side key, landmark ring, display tag). Tags are subject-relative because that
 # is what the rings actually are; the keys are historical.
 SIDES = (
@@ -92,33 +97,77 @@ def crop_at(gray, cx, cy, eye_width, pad_w=PAD_W, pad_h=PAD_H, roll=0.0):
     training crop holds a near-upright one. Passing the head roll cuts the crop in
     the levelled frame instead, so tilt stops being a variable the classifier has
     to have seen. roll=0 reproduces the plain rectangle exactly.
+
+    Returns the crop and the four corners of the region it actually sampled, in
+    source pixels. Corners rather than a rectangle because when the crop is
+    levelled the sampled region is *tilted*, and a live view drawing an
+    axis-aligned box around a rotated crop cannot show you a misplaced one.
     """
     h, w = gray.shape[:2]
     half_w = max(eye_width * pad_w / 2, 8)
     half_h = half_w * (IN_H / IN_W) * pad_h
-    box = (max(0, int(cx - half_w)), max(0, int(cy - half_h)),
-           min(w, int(cx + half_w)), min(h, int(cy + half_h)))
 
     if roll:
-        # One warp straight to the output size: rotate about the eye, scale so the
-        # crop width maps to IN_W, then put the eye at the centre of the output.
-        m = cv2.getRotationMatrix2D((cx, cy), roll, IN_W / (2 * half_w))
-        m[0, 2] += IN_W / 2 - cx
-        m[1, 2] += IN_H / 2 - cy
+        # One warp straight to the output size: rotate about the eye, scale each
+        # axis so the crop maps to IN_W x IN_H, then put the eye at the centre of
+        # the output. Scaling per axis rather than uniformly is what makes this
+        # agree with the branch below for any pad_h, not only pad_h=1.
+        th = math.radians(roll)
+        cos, sin = math.cos(th), math.sin(th)
+        sx, sy = IN_W / (2 * half_w), IN_H / (2 * half_h)
+        m = np.array([[sx * cos, sx * sin, 0.0],
+                      [-sy * sin, sy * cos, 0.0]])
+        m[:, 2] = (IN_W / 2, IN_H / 2) - m[:, :2] @ (cx, cy)
         crop = cv2.warpAffine(gray, m, (IN_W, IN_H), flags=cv2.INTER_AREA,
                               borderMode=cv2.BORDER_REPLICATE)
-        return crop, box
+        return crop, crop_quad(cx, cy, half_w, half_h, roll)
 
+    box = (max(0, int(cx - half_w)), max(0, int(cy - half_h)),
+           min(w, int(cx + half_w)), min(h, int(cy + half_h)))
     x0, y0, x1, y1 = box
+    quad = crop_quad(cx, cy, half_w, half_h, 0.0)
     if x1 <= x0 + 2 or y1 <= y0 + 2:
-        return None, box
+        return None, quad
     crop = cv2.resize(gray[y0:y1, x0:x1], (IN_W, IN_H), interpolation=cv2.INTER_AREA)
-    return crop, box
+    return crop, quad
 
 
-def eye_centre(lm, ring, w, h):
+def crop_quad(cx, cy, half_w, half_h, roll):
+    """Corners of the sampled region in source pixels, in draw order."""
+    th = math.radians(roll)
+    cos, sin = math.cos(th), math.sin(th)
+    corners = np.array([[-half_w, -half_h], [half_w, -half_h],
+                        [half_w, half_h], [-half_w, half_h]])
+    # Inverse of the levelling rotation: these are levelled-frame offsets being
+    # put back into the source frame.
+    back = np.stack([corners[:, 0] * cos - corners[:, 1] * sin,
+                     corners[:, 0] * sin + corners[:, 1] * cos], axis=1)
+    return back + (cx, cy)
+
+
+def eye_centre(lm, ring, w, h, roll=0.0):
+    """Centre and width of one eye in pixels, given the roll the crop will be
+    levelled by.
+
+    The width is measured along that levelled axis. The obvious alternative - the
+    width of an axis-aligned box around the ring, which is what this did - shrinks
+    as the head tilts, because a rotated ellipse projects narrower onto x.
+    Measured over a synthetic roll sweep (`roll_sweep.py`) it read 0.81x the true
+    width at 35 degrees while the levelled measure stayed within 3%, and since the
+    width sets the crop's scale, that silently zoomed every crop on a tilted head
+    by about 1.2x against everything the model was fitted on.
+
+    ``roll=0`` reproduces the axis-aligned measure exactly, which is what
+    generations fitted before this change need.
+    """
     pts = np.array([[lm[i].x * w, lm[i].y * h] for i in ring])
-    return (pts[:, 0].mean(), pts[:, 1].mean(), pts[:, 0].max() - pts[:, 0].min())
+    cx, cy = pts[:, 0].mean(), pts[:, 1].mean()
+    if roll:
+        th = math.radians(roll)
+        proj = (pts[:, 0] - cx) * math.cos(th) + (pts[:, 1] - cy) * math.sin(th)
+    else:
+        proj = pts[:, 0] - cx
+    return cx, cy, float(proj.max() - proj.min())
 
 
 def roll_from(lm, w, h):
@@ -128,7 +177,19 @@ def roll_from(lm, w, h):
     return math.degrees(math.atan2(ly - ry, lx - rx))
 
 
-def make_crop(gray, lm, ring, pad_w=PAD_W, pad_h=PAD_H, roll=None):
+def eye_geometry(lm, w, h, level_width=True):
+    """``({side: (cx, cy, width)}, roll)`` - the whole crop geometry for a face.
+
+    One function so the mesh locator, the capture path and the crop cache cannot
+    drift apart on how a width is measured; they did, and a width is a scale.
+    """
+    roll = roll_from(lm, w, h)
+    return ({side: eye_centre(lm, ring, w, h, roll if level_width else 0.0)
+             for side, ring, _tag in SIDES}, roll)
+
+
+def make_crop(gray, lm, ring, pad_w=PAD_W, pad_h=PAD_H, roll=None,
+              level_width=True):
     """Eye crop from mesh landmarks. Landmarks locate the eye reliably on infrared
     even where they track eyelid *shape* poorly, so position is all this asks.
 
@@ -137,9 +198,9 @@ def make_crop(gray, lm, ring, pad_w=PAD_W, pad_h=PAD_H, roll=None):
     (measured 56.9% at 30 degrees against 98.3% levelled).
     """
     h, w = gray.shape[:2]
-    cx, cy, width = eye_centre(lm, ring, w, h)
     if roll is None:
         roll = roll_from(lm, w, h)
+    cx, cy, width = eye_centre(lm, ring, w, h, roll if level_width else 0.0)
     return crop_at(gray, cx, cy, width, pad_w, pad_h, roll)
 
 
@@ -235,6 +296,11 @@ class Dataset:
                 geoms = z["geom"]
                 if geoms.shape[1] < 4:
                     raise ValueError("cache predates roll-levelled crops")
+                # A crop cut under an older convention is the same shape and the
+                # same 40x24 of plausible-looking eye, so nothing downstream can
+                # notice. Rebuild on any mismatch.
+                if str(z["convention"]) != CROP_CONVENTION:
+                    raise ValueError("cache predates the current crop convention")
                 cached = {str(n): crops[i] for i, n in enumerate(names)}
                 geom = {str(n): geoms[i] for i, n in enumerate(names)}
             except Exception:
@@ -244,25 +310,26 @@ class Dataset:
         missing_frames = sorted({r["frame"] for r in self.rows
                                  if sample_id(r["frame"], r["side"]) not in cached})
         if missing_frames:
-            import mediapipe as mp
-            from .model import make_landmarker
-            landmarker = landmarker or make_landmarker()
+            # The same locator the live view runs, not a bare mesh call. A
+            # training crop cut one way and an inference crop cut another is a
+            # template matcher being shown a template it was never fitted on, and
+            # nothing about a 40x24 thumbnail makes that visible. A frame this
+            # cannot locate loses its labels from training entirely.
+            from .detect import default_locator
+            locator = default_locator(landmarker)
             for i, frame in enumerate(missing_frames):
                 g = cv2.imread(os.path.join(frames_dir(self.dir), frame),
                                cv2.IMREAD_GRAYSCALE)
                 if g is None:
                     continue
-                res = landmarker.detect(mp.Image(
-                    image_format=mp.ImageFormat.SRGB,
-                    data=cv2.cvtColor(g, cv2.COLOR_GRAY2RGB)))
-                if not res.face_landmarks:
+                det = locator.locate(g)
+                if not det:
                     continue
-                lm = res.face_landmarks[0]
+                lm = det.landmarks
                 gh, gw = g.shape[:2]
-                roll = roll_from(lm, gw, gh)
-                for side, ring, _tag in SIDES:
-                    cx, cy, width = eye_centre(lm, ring, gw, gh)
-                    crop, _box = crop_at(g, cx, cy, width, roll=roll)
+                eyes, roll = eye_geometry(lm, gw, gh)
+                for side, (cx, cy, width) in eyes.items():
+                    crop, _quad = crop_at(g, cx, cy, width, roll=roll)
                     if crop is not None:
                         sid = sample_id(frame, side)
                         cached[sid] = crop
@@ -283,7 +350,8 @@ class Dataset:
         # capture and having to defer it.
         np.savez(self._cache_path(), names=np.array(names),
                  crops=np.stack([cache[n] for n in names]),
-                 geom=np.stack([geom[n] for n in names]))
+                 geom=np.stack([geom[n] for n in names]),
+                 convention=CROP_CONVENTION)
 
     # -- queries ---------------------------------------------------------
     def samples(self):
@@ -341,10 +409,9 @@ class Dataset:
 
         if lm is not None:
             h, w = gray.shape[:2]
-            roll = roll_from(lm, w, h)
-            for side, ring, _tag in SIDES:
-                cx, cy, width = eye_centre(lm, ring, w, h)
-                crop, _box = crop_at(gray, cx, cy, width, roll=roll)
+            eyes, roll = eye_geometry(lm, w, h)
+            for side, (cx, cy, width) in eyes.items():
+                crop, _quad = crop_at(gray, cx, cy, width, roll=roll)
                 if crop is not None:
                     sid = sample_id(frame, side)
                     self.crops[sid] = crop
@@ -427,8 +494,8 @@ class Dataset:
                 for _ in range(copies):
                     dx, dy = rng.uniform(-JITTER_PX, JITTER_PX, 2)
                     scale = 1.0 + rng.uniform(-JITTER_SCALE, JITTER_SCALE)
-                    crop, _box = crop_at(gray, cx + dx, cy + dy, width * scale,
-                                         roll=roll)
+                    crop, _quad = crop_at(gray, cx + dx, cy + dy, width * scale,
+                                          roll=roll)
                     if crop is not None:
                         out.append(dict(id=s["id"], frame=frame, side=s["side"],
                                         label=s["label"], burst=s["burst"],

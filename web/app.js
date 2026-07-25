@@ -184,7 +184,10 @@ async function loadModels() {
       m.id,
       (m.created_at || "").replace("T", " ").replace("+00:00", ""),
       pct(m.accuracy),
-      m.n_unseen ? `${pct(m.unseen_accuracy)} (${m.n_unseen})` : "—",
+      // Not scored rather than scored wrongly: a generation fitted on an older
+      // crop convention cannot be compared on crops cut to this one.
+      m.stale_convention ? "old crop convention"
+        : m.n_unseen ? `${pct(m.unseen_accuracy)} (${m.n_unseen})` : "—",
       `${m.n_train} in ${m.n_bursts} bursts`,
       `${counts.open || 0}/${counts.closed || 0}/${counts.skip || 0}`,
     ];

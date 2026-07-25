@@ -178,12 +178,13 @@ class EyeModel:
     """Loaded classifier. ``predict`` returns P(open) per crop."""
 
     def __init__(self, coef, intercept, accuracy=float("nan"), blur=BLUR_SIGMA,
-                 normalise=NORMALISE):
+                 normalise=NORMALISE, level_width=True):
         self.coef = np.asarray(coef, dtype=np.float32)
         self.intercept = float(intercept)
         self.accuracy = float(accuracy)
         self.blur = float(blur)
         self.normalise = normalise
+        self.level_width = bool(level_width)
 
     @classmethod
     def load(cls, path=DEFAULT_PATH):
@@ -194,8 +195,11 @@ class EyeModel:
         # Generations predating normalisation were fitted on absolute pixel
         # values; "none" keeps them meaning what they meant when trained.
         norm = str(d["normalise"]) if "normalise" in d.files else "none"
+        # Generations predating the levelled width were fitted on crops whose
+        # scale came from an axis-aligned box, so they must keep being fed those.
+        level_width = bool(d["level_width"]) if "level_width" in d.files else False
         return cls(d["coef"], d["intercept"],
-                   d.get("cv_accuracy", float("nan")), blur, norm)
+                   d.get("cv_accuracy", float("nan")), blur, norm, level_width)
 
     @classmethod
     def exists(cls, path=DEFAULT_PATH):
@@ -205,7 +209,7 @@ class EyeModel:
         np.savez(path, coef=self.coef, intercept=self.intercept,
                  in_h=data.IN_H, in_w=data.IN_W, blur=self.blur,
                  normalise=self.normalise, pad_w=data.PAD_W, pad_h=data.PAD_H,
-                 cv_accuracy=self.accuracy)
+                 level_width=self.level_width, cv_accuracy=self.accuracy)
 
     def p_closed(self, crops):
         crops = [c for c in crops if c is not None]
@@ -224,7 +228,7 @@ class EyeModel:
         return out
 
     def eyes(self, gray, lm, roll=None):
-        """P(open) and crop box for both eyes, from mesh landmarks.
+        """P(open) and the sampled quad for both eyes, from mesh landmarks.
 
         The crop is levelled using the head roll, because locating a tilted eye
         is not the same as being able to classify it.
@@ -232,28 +236,30 @@ class EyeModel:
         h, w = gray.shape[:2]
         if roll is None:
             roll = data.roll_from(lm, w, h)
-        crops, boxes = [], []
+        crops, quads = [], []
         for _side, ring, _tag in data.SIDES:
-            crop, box = data.make_crop(gray, lm, ring, roll=roll)
+            crop, quad = data.make_crop(gray, lm, ring, roll=roll,
+                                        level_width=self.level_width)
             crops.append(crop)
-            boxes.append(box)
-        return self.predict(crops), crops, boxes
+            quads.append(quad)
+        return self.predict(crops), crops, quads
 
     def eyes_from(self, gray, detection):
-        """P(open) and crop box per side, from any detector's eye positions.
+        """P(open) and the sampled quad per side, from any detector's eye
+        positions.
 
         Keyed by side rather than positional, so a detector that finds only one
         eye still contributes the one it found.
         """
-        sides, crops, boxes = [], [], []
+        sides, crops, quads = [], [], []
         for side, _ring, _tag in data.SIDES:
             eye = detection.eyes.get(side)
             if eye is None:
                 continue
-            crop, box = data.crop_at(gray, eye.cx, eye.cy, eye.width,
-                                     roll=getattr(detection, "roll", 0.0) or 0.0)
+            crop, quad = data.crop_at(gray, eye.cx, eye.cy, eye.width,
+                                      roll=getattr(detection, "roll", 0.0) or 0.0)
             sides.append(side)
             crops.append(crop)
-            boxes.append(box)
+            quads.append(quad)
         probs = self.predict(crops)
-        return dict(zip(sides, probs)), dict(zip(sides, crops)), dict(zip(sides, boxes))
+        return dict(zip(sides, probs)), dict(zip(sides, crops)), dict(zip(sides, quads))

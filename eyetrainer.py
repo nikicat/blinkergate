@@ -29,7 +29,6 @@ right of the strip is the one on the right of the frame.
 """
 
 import argparse
-import os
 import sys
 import time
 
@@ -41,13 +40,11 @@ import numpy as np
 from bgate import data, ui
 from bgate.camera import IRCamera, DEFAULT_DEVICE
 from bgate.data import Dataset
-from bgate.detect import (BoxedMeshLocator, Cascade, MediaPipeLocator,
-                          RollTracker, YuNetLocator)
-from bgate.model import fit, make_landmarker
+from bgate.detect import default_locator
+from bgate.model import fit
 from bgate.registry import Registry
 
 WIN = "blinkergate"
-YUNET_MODEL = "face_detection_yunet.onnx"
 POLL_EVERY = 1.0              # seconds between checks for a generation switch
 CAPTURES = {
     ord("o"): ("both OPEN", data.OPEN, data.OPEN),
@@ -249,13 +246,15 @@ class App:
 
         if det and self.model:
             lm = det.landmarks
-            probs, _crops, boxes = self.model.eyes(gray, lm, roll=det.roll)
+            probs, _crops, quads = self.model.eyes(gray, lm, roll=det.roll)
             shut = [p is not None and p < self.args.thresh for p in probs]
-            for box, is_shut in zip(boxes, shut):
-                x0, y0, x1, y1 = [int(v * ui.S) for v in box]
-                cv2.rectangle(annot, (x0, y0), (x1, y1),
+            # The quad, not a rectangle around it: the crop is cut in the levelled
+            # frame, so an axis-aligned box would draw something the classifier
+            # never sees and hide exactly the misplacement worth noticing.
+            for quad, is_shut in zip(quads, shut):
+                cv2.polylines(annot, [(quad * ui.S).astype(np.int32)], True,
                               (0, 0, 255) if is_shut else (0, 255, 0),
-                              max(1, int(ui.S * 0.6)))
+                              max(1, int(ui.S * 0.6)), cv2.LINE_AA)
             insets = [
                 ui.eye_inset(gray, lm, ring,
                              ui.IRIS_L if side == "img_left" else ui.IRIS_R,
@@ -302,20 +301,12 @@ def main():
     ui.S = args.scale
 
     try:
-        # Two locators, tried in order, because they fail in different places.
-        # Roll-compensated mesh handles a tilted head (72% of the hard frames);
-        # YuNet finds the face in dark low-contrast ones the mesh drops, and the
-        # mesh then runs inside its box so the landmarks - and therefore the crop
-        # convention - stay the mesh's own. Together 77%, against 49% for the
-        # plain mesh.
-        mesh = MediaPipeLocator(make_landmarker())
-        stages = [RollTracker(MediaPipeLocator(make_landmarker()))]
-        if os.path.exists(YUNET_MODEL):
-            stages.append(BoxedMeshLocator(
-                YuNetLocator(YUNET_MODEL, (640, 360)), mesh))
-        else:
-            print(f"{YUNET_MODEL} missing - run: uv run fetch_model.py")
-        locator = Cascade(stages)
+        # Shared with the crop cache, so training crops and live crops are cut by
+        # the same stack. Finding a tilted face and locating the eyes inside it
+        # are different problems and only the first shows up in a detection rate;
+        # the refit inside this is worth 94.2% -> 95.4% upright and
+        # 69.7% -> 86.7% at 35 degrees of roll.
+        locator = default_locator(warn=print)
     except FileNotFoundError as exc:
         sys.exit(str(exc))
 
