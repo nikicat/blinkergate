@@ -1,0 +1,23 @@
+[project]
+name = "blinkergate"
+version = "0.1.0"
+description = "Per-eye open/closed detection enrolled on your own IR camera"
+readme = "README.md"
+requires-python = ">=3.10"
+dependencies = [
+    "fastapi>=0.140.0",
+    "mediapipe>=0.10.30",
+    "numpy>=1.24",
+    "opencv-python>=4.8",
+    "scikit-learn>=1.3",
+    "uvicorn>=0.51.0",
+]
+
+[tool.uv]
+# Run from the source tree; there is nothing worth installing as a library yet.
+package = false
+
+[dependency-groups]
+dev = [
+    "httpx2>=2.9.1",
+]

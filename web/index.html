@@ -1,0 +1,78 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>blinkergate</title>
+<link rel="stylesheet" href="/static/app.css">
+</head>
+<body>
+<header>
+  <h1>blinkergate</h1>
+  <nav>
+    <button class="tab active" data-view="dataset">Dataset</button>
+    <button class="tab" data-view="models">Models</button>
+  </nav>
+  <div id="summary" class="summary"></div>
+</header>
+
+<section id="dataset-view">
+  <div class="toolbar">
+    <label>Sort
+      <select id="sort">
+        <option value="uncertainty">most uncertain</option>
+        <option value="disagreement">disagrees with model</option>
+        <option value="burst">by capture burst</option>
+        <option value="newest">newest first</option>
+        <option value="label">by label</option>
+      </select>
+    </label>
+    <label>Show
+      <select id="filter">
+        <option value="all">all</option>
+        <option value="open">open</option>
+        <option value="closed">closed</option>
+        <option value="skip">skip</option>
+        <option value="trainable">open + closed</option>
+        <option value="conflict">disagrees with model</option>
+      </select>
+    </label>
+    <span class="spacer"></span>
+    <span id="selcount" class="muted">0 selected</span>
+    <button id="sel-all">Select shown</button>
+    <button id="sel-none">Clear</button>
+    <span class="sep"></span>
+    <button class="label-btn open" data-label="open">Open <kbd>o</kbd></button>
+    <button class="label-btn closed" data-label="closed">Closed <kbd>c</kbd></button>
+    <button class="label-btn skip" data-label="skip">Skip <kbd>s</kbd></button>
+    <span class="sep"></span>
+    <button id="train" class="primary">Train new generation</button>
+  </div>
+  <p class="hint">
+    Click to select, shift-click for a range. Sides are sides of the <em>image</em>.
+    Nothing is ever deleted &mdash; <strong>skip</strong> only excludes a sample
+    from training, and relabelling brings it back.
+  </p>
+  <div id="grid" class="grid"></div>
+</section>
+
+<section id="models-view" hidden>
+  <p class="hint">
+    Every training run appends a generation and keeps its dataset snapshot.
+    <strong>held-out</strong> is scored on bursts withheld during that fit;
+    <strong>on newer labels</strong> re-scores it against samples labelled since,
+    which it has never seen &mdash; the fair way to compare generations.
+  </p>
+  <table id="models">
+    <thead><tr>
+      <th></th><th>generation</th><th>created</th><th>held-out</th>
+      <th>on newer labels</th><th>trained on</th><th>labels at the time</th>
+    </tr></thead>
+    <tbody></tbody>
+  </table>
+</section>
+
+<div id="toast" class="toast" hidden></div>
+<script src="/static/app.js"></script>
+</body>
+</html>

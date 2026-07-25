@@ -1,0 +1,15 @@
+# Your face. Never commit these.
+dataset/
+*.npz
+
+# MediaPipe bundle, fetched with fetch_model.py
+face_landmarker.task
+
+__pycache__/
+*.py[cod]
+venv/
+.venv/
+.venv/
+
+# Model generations: derived from your face data, keep local.
+models/

@@ -1,0 +1,44 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 760 210" width="760" height="210"
+     font-family="ui-sans-serif, system-ui, -apple-system, Segoe UI, Roboto, sans-serif">
+  <defs>
+    <marker id="arrow" viewBox="0 0 10 10" refX="9" refY="5"
+            markerWidth="6" markerHeight="6" orient="auto-start-reverse">
+      <path d="M 0 0 L 10 5 L 0 10 z" fill="#8b93a1"/>
+    </marker>
+  </defs>
+
+  <rect x="18" y="40" width="200" height="104" rx="10"
+        fill="none" stroke="#3fa66a" stroke-width="2"/>
+  <text x="34" y="68" font-size="17" font-weight="600" fill="#3fa66a">LIVE</text>
+  <text x="34" y="92" font-size="13" fill="#8b93a1">detection in real time</text>
+  <text x="34" y="112" font-size="13" fill="#8b93a1">o / c / 1 / 2 capture</text>
+  <text x="34" y="132" font-size="13" fill="#8b93a1">2s burst per press</text>
+
+  <rect x="280" y="40" width="200" height="104" rx="10"
+        fill="none" stroke="#d2833a" stroke-width="2"/>
+  <text x="296" y="68" font-size="17" font-weight="600" fill="#d2833a">DATA</text>
+  <text x="296" y="92" font-size="13" fill="#8b93a1">every sample as a tile</text>
+  <text x="296" y="112" font-size="13" fill="#8b93a1">sorted by disagreement</text>
+  <text x="296" y="132" font-size="13" fill="#8b93a1">d delete · f flip label</text>
+
+  <rect x="542" y="40" width="200" height="104" rx="10"
+        fill="none" stroke="#6a8fd4" stroke-width="2"/>
+  <text x="558" y="68" font-size="17" font-weight="600" fill="#6a8fd4">TRAIN</text>
+  <text x="558" y="92" font-size="13" fill="#8b93a1">refit, reload live</text>
+  <text x="558" y="112" font-size="13" fill="#8b93a1">bursts held out</text>
+  <text x="558" y="132" font-size="13" fill="#8b93a1">~5 KB, 0.04 ms</text>
+
+  <line x1="222" y1="80" x2="274" y2="80" stroke="#8b93a1" stroke-width="1.6"
+        marker-end="url(#arrow)"/>
+  <text x="228" y="72" font-size="11" fill="#8b93a1">TAB</text>
+  <line x1="484" y1="80" x2="536" y2="80" stroke="#8b93a1" stroke-width="1.6"
+        marker-end="url(#arrow)"/>
+  <text x="497" y="72" font-size="11" fill="#8b93a1">t</text>
+
+  <path d="M 642 150 L 642 180 L 118 180 L 118 150" fill="none"
+        stroke="#8b93a1" stroke-width="1.6" stroke-dasharray="5 4"
+        marker-end="url(#arrow)"/>
+  <text x="330" y="196" font-size="12" fill="#8b93a1">
+    better model surfaces the next batch of bad samples
+  </text>
+</svg>
