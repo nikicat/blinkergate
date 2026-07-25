@@ -86,15 +86,19 @@ class Registry:
     def list(self):
         return [m for m in (self.meta(g) for g in self.ids()) if m]
 
-    def create(self, coef, intercept, accuracy, samples, all_rows):
+    def create(self, coef, intercept, accuracy, samples, all_rows, blur=None,
+               normalise=None):
         """Write a new generation. ``samples`` are the ones that trained it;
         ``all_rows`` is the whole label file, skips included, so the snapshot
         records what was excluded as well as what was used."""
         gen = self.next_id()
         os.makedirs(self.path(gen), exist_ok=True)
 
+        from .model import BLUR_SIGMA, NORMALISE
+        blur = BLUR_SIGMA if blur is None else blur
+        normalise = NORMALISE if normalise is None else normalise
         np.savez(self.path(gen, "model.npz"), coef=coef, intercept=intercept,
-                 in_h=data.IN_H, in_w=data.IN_W,
+                 in_h=data.IN_H, in_w=data.IN_W, blur=blur, normalise=normalise,
                  pad_w=data.PAD_W, pad_h=data.PAD_H, cv_accuracy=accuracy)
 
         with open(self.path(gen, "dataset.csv"), "w", newline="") as fh:
@@ -111,7 +115,8 @@ class Registry:
             "n_bursts": len({s["burst"] for s in samples}),
             "counts": counts,
             "crop": {"pad_w": data.PAD_W, "pad_h": data.PAD_H,
-                     "in_h": data.IN_H, "in_w": data.IN_W},
+                     "in_h": data.IN_H, "in_w": data.IN_W, "blur": blur,
+                     "normalise": normalise},
             "crops_sha256": crops_hash(samples),
             "versions": _versions(),
         }
@@ -150,6 +155,14 @@ class Registry:
             raise ValueError(f"unknown generation {gen!r}")
         with open(os.path.join(self.root, ACTIVE), "w") as fh:
             fh.write(gen + "\n")
+
+    def dir_mtime(self):
+        """Changes when a generation is added or removed. Lets a second process
+        notice new generations without listing the directory every frame."""
+        try:
+            return os.path.getmtime(self.root)
+        except OSError:
+            return 0.0
 
     def active_mtime(self):
         """For cheap change detection: the live view polls this instead of

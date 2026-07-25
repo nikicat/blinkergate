@@ -81,7 +81,8 @@ function render() {
     const meta = document.createElement("div");
     meta.className = "meta";
     const left = document.createElement("span");
-    left.textContent = s.side === "img_left" ? "L" : "R";
+    // "img_left" is the subject's left eye - on the RIGHT of the picture.
+    left.textContent = s.side === "img_left" ? "your L" : "your R";
     const right = document.createElement("span");
     right.textContent = s.p_closed === null ? "-" : `p${s.p_closed.toFixed(2)}`;
     meta.append(left, right);

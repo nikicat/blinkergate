@@ -71,6 +71,8 @@ def create_app(ds_dir="dataset", models_dir="models"):
 
     @app.get("/api/samples")
     def samples():
+        # The camera app writes captures to the same files; pick them up.
+        state.dataset.reload_if_changed()
         rows = state.dataset.samples()
         preds = state.predictions(rows)
         return {
@@ -99,6 +101,7 @@ def create_app(ds_dir="dataset", models_dir="models"):
 
     @app.get("/api/models")
     def models():
+        state.dataset.reload_if_changed()
         # Only open/closed can be scored - a skipped sample has no true class,
         # and including them would report noise as accuracy.
         current = state.dataset.trainable()
@@ -123,6 +126,7 @@ def create_app(ds_dir="dataset", models_dir="models"):
 
     @app.post("/api/models")
     def train():
+        state.dataset.reload_if_changed()
         samples = state.dataset.trainable()
         counts = state.dataset.counts()
         if min(counts[data.OPEN], counts[data.CLOSED]) < 10:

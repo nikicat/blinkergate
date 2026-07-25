@@ -13,3 +13,4 @@ venv/
 
 # Model generations: derived from your face data, keep local.
 models/
+face_detection_yunet.onnx

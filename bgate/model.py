@@ -20,6 +20,45 @@ from . import data, ui
 
 DEFAULT_PATH = "eyemodel.npz"
 
+# Gaussian blur applied to a crop before it becomes a feature vector.
+#
+# A linear model on raw pixels is a template matcher, and templates are brittle:
+# measured on held-out bursts, a 4px crop shift cost 13 points of accuracy. Every
+# source of geometry noise - head pose, distance, a different detector - lands
+# there. Blurring makes each feature cover more area, so a shift moves the content
+# a smaller fraction of a feature.
+#
+# Measured across shifts of 0-6px, sigma 1.2-2.0 is a plateau; 1.6 sits in the
+# middle and costs nothing at zero shift:
+#     sigma      0px     2px     3px     4px     6px
+#     none     98.8%   97.3%   94.5%   85.4%   78.3%
+#     1.6      98.8%   98.0%   97.2%   92.1%   81.0%
+#
+# Jitter augmentation was tried first and made things WORSE (81.3% at 4px with
+# 4 copies): averaging a template over shifted copies blurs it without teaching
+# invariance, which needs pooling. See Dataset.jittered.
+BLUR_SIGMA = 1.6
+
+# Per-crop contrast normalisation.
+#
+# Without it the features are absolute pixel values, so the decision boundary is
+# calibrated to the illumination of whichever session was captured. Ambient IR
+# changes - time of day, distance to the emitter, the angle your face presents -
+# and the model silently stops working. Measured on held-out bursts with the
+# frame scaled to simulate that:
+#
+#     features        x0.6    x0.75   as-is    x1.3   gamma1.4
+#     raw            57.2%    61.4%   98.8%   88.3%     66.3%
+#     standardise    98.8%    98.8%   98.8%   98.8%     98.8%
+#
+# Subtracting the mean and dividing by the standard deviation removes gain and
+# offset exactly, which is what a lighting change mostly is. CLAHE and DoG also
+# help but less completely (76.9% and 96.6% worst-case).
+#
+# Like the blur, this is carried in the model: features normalised one way are
+# meaningless to a model fitted the other way.
+NORMALISE = "standardise"
+
 
 def make_landmarker(model_path=None):
     """MediaPipe face landmarker in IMAGE mode.
@@ -41,56 +80,111 @@ def make_landmarker(model_path=None):
             running_mode=vision.RunningMode.IMAGE, num_faces=1))
 
 
-def features(crops):
-    return np.stack([c.reshape(-1).astype(np.float32) / 255.0 for c in crops])
+def features(crops, blur=BLUR_SIGMA, normalise=NORMALISE):
+    out = []
+    for crop in crops:
+        x = crop.astype(np.float32)
+        if blur:
+            x = cv2.GaussianBlur(x, (0, 0), blur)
+        if normalise == "standardise":
+            x = (x - x.mean()) / (x.std() + 1e-6)
+        else:
+            x = x / 255.0
+        out.append(x.reshape(-1))
+    return np.stack(out)
 
 
-def fit(samples):
+def _make_clf():
+    from sklearn.linear_model import LogisticRegression
+    from sklearn.pipeline import make_pipeline
+    from sklearn.preprocessing import StandardScaler
+    return make_pipeline(StandardScaler(),
+                         LogisticRegression(max_iter=3000, C=0.05))
+
+
+def _flatten(clf):
+    """Fold the scaler into the linear layer: inference becomes one dot product."""
+    scaler = clf.named_steps["standardscaler"]
+    lr = clf.named_steps["logisticregression"]
+    coef = (lr.coef_[0] / scaler.scale_).astype(np.float32)
+    intercept = float(lr.intercept_[0] -
+                      np.dot(lr.coef_[0], scaler.mean_ / scaler.scale_))
+    return coef, intercept
+
+
+def fit(samples, augment=None, blur=BLUR_SIGMA, normalise=NORMALISE):
     """Fit on labelled samples. Returns (coef, intercept, held_out_accuracy).
 
     Validation groups by capture burst: frames from one key press are near
     duplicates, so splitting them across train and test would score memorisation
     rather than generalisation.
-    """
-    from sklearn.linear_model import LogisticRegression
-    from sklearn.model_selection import GroupKFold, cross_val_score
-    from sklearn.pipeline import make_pipeline
-    from sklearn.preprocessing import StandardScaler
 
-    X = features([s["crop"] for s in samples])
+    ``augment`` is an optional callable taking a list of samples and returning
+    extra ones. It is applied **to training folds only** - never to the fold being
+    scored - so the reported accuracy stays comparable with generations trained
+    without it, and cannot be inflated by testing on near-copies of training rows.
+    Measured, jitter augmentation hurt; the hook is kept because the measurement
+    is worth being able to repeat, not because it is recommended.
+
+    ``blur`` and ``normalise`` must be carried into the model: features built one
+    way are meaningless to a model fitted the other way.
+    """
+    from sklearn.model_selection import GroupKFold
+
     y = np.array([1 if s["label"] == data.CLOSED else 0 for s in samples])
     groups = np.array([s.get("burst") or data.burst_of(s["frame"]) for s in samples])
     if len(set(y)) < 2:
         raise ValueError("need both open and closed samples")
+    X = features([s["crop"] for s in samples], blur, normalise)
 
-    clf = make_pipeline(StandardScaler(), LogisticRegression(max_iter=3000, C=0.05))
+    def matrix(rows):
+        return features([r["crop"] for r in rows], blur, normalise), \
+               np.array([1 if r["label"] == data.CLOSED else 0 for r in rows])
+
     accuracy = float("nan")
     n_groups = len(set(groups))
     if n_groups >= 2:
-        accuracy = float(cross_val_score(
-            clf, X, y, groups=groups, cv=GroupKFold(n_splits=min(5, n_groups))).mean())
+        scores = []
+        for train_idx, test_idx in GroupKFold(
+                n_splits=min(5, n_groups)).split(X, y, groups):
+            rows = [samples[i] for i in train_idx]
+            extra = augment(rows) if augment else []
+            Xtr, ytr = matrix(rows + extra) if extra else (X[train_idx], y[train_idx])
+            clf = _make_clf()
+            clf.fit(Xtr, ytr)
+            scores.append(clf.score(X[test_idx], y[test_idx]))
+        accuracy = float(np.mean(scores))
 
-    clf.fit(X, y)
-    scaler = clf.named_steps["standardscaler"]
-    lr = clf.named_steps["logisticregression"]
-    # Fold the scaler into the linear layer so inference is a single dot product.
-    coef = (lr.coef_[0] / scaler.scale_).astype(np.float32)
-    intercept = float(lr.intercept_[0] - np.dot(lr.coef_[0], scaler.mean_ / scaler.scale_))
+    extra = augment(samples) if augment else []
+    Xall, yall = matrix(samples + extra) if extra else (X, y)
+    clf = _make_clf()
+    clf.fit(Xall, yall)
+    coef, intercept = _flatten(clf)
     return coef, intercept, accuracy
 
 
 class EyeModel:
     """Loaded classifier. ``predict`` returns P(open) per crop."""
 
-    def __init__(self, coef, intercept, accuracy=float("nan")):
+    def __init__(self, coef, intercept, accuracy=float("nan"), blur=BLUR_SIGMA,
+                 normalise=NORMALISE):
         self.coef = np.asarray(coef, dtype=np.float32)
         self.intercept = float(intercept)
         self.accuracy = float(accuracy)
+        self.blur = float(blur)
+        self.normalise = normalise
 
     @classmethod
     def load(cls, path=DEFAULT_PATH):
         d = np.load(path)
-        return cls(d["coef"], d["intercept"], d.get("cv_accuracy", float("nan")))
+        # Generations predating the blur were fitted on sharp features; defaulting
+        # to 0.0 keeps them meaning what they meant when they were trained.
+        blur = float(d["blur"]) if "blur" in d.files else 0.0
+        # Generations predating normalisation were fitted on absolute pixel
+        # values; "none" keeps them meaning what they meant when trained.
+        norm = str(d["normalise"]) if "normalise" in d.files else "none"
+        return cls(d["coef"], d["intercept"],
+                   d.get("cv_accuracy", float("nan")), blur, norm)
 
     @classmethod
     def exists(cls, path=DEFAULT_PATH):
@@ -98,14 +192,17 @@ class EyeModel:
 
     def save(self, path=DEFAULT_PATH):
         np.savez(path, coef=self.coef, intercept=self.intercept,
-                 in_h=data.IN_H, in_w=data.IN_W,
-                 pad_w=data.PAD_W, pad_h=data.PAD_H, cv_accuracy=self.accuracy)
+                 in_h=data.IN_H, in_w=data.IN_W, blur=self.blur,
+                 normalise=self.normalise, pad_w=data.PAD_W, pad_h=data.PAD_H,
+                 cv_accuracy=self.accuracy)
 
     def p_closed(self, crops):
         crops = [c for c in crops if c is not None]
         if not crops:
             return np.array([])
-        return 1.0 / (1.0 + np.exp(-(features(crops) @ self.coef + self.intercept)))
+        return 1.0 / (1.0 + np.exp(
+            -(features(crops, self.blur, self.normalise) @ self.coef
+              + self.intercept)))
 
     def predict(self, crops):
         """P(open) per crop, preserving None entries."""
@@ -116,10 +213,28 @@ class EyeModel:
         return out
 
     def eyes(self, gray, lm):
-        """P(open) and crop box for both eyes of one frame."""
+        """P(open) and crop box for both eyes, from mesh landmarks."""
         crops, boxes = [], []
         for _side, ring, _tag in data.SIDES:
             crop, box = data.make_crop(gray, lm, ring)
             crops.append(crop)
             boxes.append(box)
         return self.predict(crops), crops, boxes
+
+    def eyes_from(self, gray, detection):
+        """P(open) and crop box per side, from any detector's eye positions.
+
+        Keyed by side rather than positional, so a detector that finds only one
+        eye still contributes the one it found.
+        """
+        sides, crops, boxes = [], [], []
+        for side, _ring, _tag in data.SIDES:
+            eye = detection.eyes.get(side)
+            if eye is None:
+                continue
+            crop, box = data.crop_at(gray, eye.cx, eye.cy, eye.width)
+            sides.append(side)
+            crops.append(crop)
+            boxes.append(box)
+        probs = self.predict(crops)
+        return dict(zip(sides, probs)), dict(zip(sides, crops)), dict(zip(sides, boxes))

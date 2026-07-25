@@ -1,8 +1,12 @@
 """The dataset: captured frames and one label per eye.
 
 A *sample* is a single eye from a single frame, identified by ``frame|side``.
-Sides are sides of the picture, not of your face: the feed is not mirrored, so
-your left eye appears on the image's right.
+
+Sides are **yours**, not the picture's. ``img_left`` is your left eye, which on an
+unmirrored feed appears on the RIGHT of the image (measured: mean x 347 of 640,
+against 307 for ``img_right``). That follows MediaPipe, whose "left eye" ring is
+the subject's left. The key names are historical and stay as they are, because
+they are what every existing label is keyed by.
 
 Labels are ``open``, ``closed`` or ``skip``. Only open and closed train a model;
 ``skip`` marks a sample as junk without removing anything. **Captures are never
@@ -27,10 +31,11 @@ from . import ui
 PAD_W, PAD_H = 1.6, 1.0
 IN_H, IN_W = 24, 40
 
-# (side key, landmark ring, display tag)
+# (side key, landmark ring, display tag). Tags are subject-relative because that
+# is what the rings actually are; the keys are historical.
 SIDES = (
-    ("img_left", ui.RING_L, "IMG-L"),
-    ("img_right", ui.RING_R, "IMG-R"),
+    ("img_left", ui.RING_L, "YOUR LEFT"),
+    ("img_right", ui.RING_R, "YOUR RIGHT"),
 )
 OPEN, CLOSED, SKIP = "open", "closed", "skip"
 LABELS = (OPEN, CLOSED, SKIP)
@@ -40,6 +45,13 @@ SAMPLES_CSV = "samples.csv"
 LEGACY_CSV = "labels.csv"          # one row per frame, img_left / img_right columns
 CACHE = ".crops.npz"
 FIELDS = ["frame", "side", "label"]
+
+# Jitter used to make the classifier tolerant of crop misalignment. Measured
+# without it, a 4px shift flipped 14% of verdicts: a linear model on raw pixels
+# is a template matcher, and every source of geometry noise - head pose, a
+# different detector, distance - lands on that cliff.
+JITTER_PX = 3.0        # translation, in source pixels
+JITTER_SCALE = 0.08    # fractional eye-width
 
 
 def sample_id(frame, side):
@@ -60,14 +72,15 @@ def ensure(ds_dir):
     os.makedirs(frames_dir(ds_dir), exist_ok=True)
 
 
-def make_crop(gray, lm, ring, pad_w=PAD_W, pad_h=PAD_H):
-    """Eye crop, plus the box it came from. Landmarks locate the eye reliably on
-    infrared even where they track eyelid *shape* poorly, so position is all this
-    asks of them."""
+def crop_at(gray, cx, cy, eye_width, pad_w=PAD_W, pad_h=PAD_H):
+    """The crop, given only where the eye is and how wide it is.
+
+    This is the single definition of the geometry: any detector that can supply a
+    centre and a width produces crops the model recognises, which is what lets a
+    second detector stand in for the one the model was trained with.
+    """
     h, w = gray.shape[:2]
-    pts = np.array([[lm[i].x * w, lm[i].y * h] for i in ring])
-    cx, cy = pts[:, 0].mean(), pts[:, 1].mean()
-    half_w = max((pts[:, 0].max() - pts[:, 0].min()) * pad_w / 2, 8)
+    half_w = max(eye_width * pad_w / 2, 8)
     half_h = half_w * (IN_H / IN_W) * pad_h
     x0, y0 = max(0, int(cx - half_w)), max(0, int(cy - half_h))
     x1, y1 = min(w, int(cx + half_w)), min(h, int(cy + half_h))
@@ -75,6 +88,15 @@ def make_crop(gray, lm, ring, pad_w=PAD_W, pad_h=PAD_H):
         return None, (x0, y0, x1, y1)
     crop = cv2.resize(gray[y0:y1, x0:x1], (IN_W, IN_H), interpolation=cv2.INTER_AREA)
     return crop, (x0, y0, x1, y1)
+
+
+def make_crop(gray, lm, ring, pad_w=PAD_W, pad_h=PAD_H):
+    """Eye crop from mesh landmarks. Landmarks locate the eye reliably on infrared
+    even where they track eyelid *shape* poorly, so position is all this asks."""
+    h, w = gray.shape[:2]
+    pts = np.array([[lm[i].x * w, lm[i].y * h] for i in ring])
+    return crop_at(gray, pts[:, 0].mean(), pts[:, 1].mean(),
+                   pts[:, 0].max() - pts[:, 0].min(), pad_w, pad_h)
 
 
 def _migrate_legacy(ds_dir):
@@ -97,15 +119,22 @@ def _migrate_legacy(ds_dir):
 
 
 class Dataset:
-    """In-memory dataset. Edits mutate memory and rewrite the CSV; nothing here
-    re-reads from disk, because doing that per edit is what made the old UI
-    unusable."""
+    """In-memory dataset. Edits mutate memory and rewrite the CSV, because
+    reloading everything per edit is what made the first UI unusable.
+
+    Two processes share it - the camera app captures, the web UI labels - so each
+    checks ``samples.csv``'s mtime before serving or training and reloads only
+    when the other has actually written. A reload is ~2ms (0.7ms to parse the CSV,
+    1ms to read the crop cache), so the check is cheap enough to do per request.
+    """
 
     def __init__(self, ds_dir):
         self.dir = ds_dir
         ensure(ds_dir)
         self.rows = []          # [{frame, side, label}]
         self.crops = {}         # id -> uint8 crop
+        self.geom = {}          # id -> (cx, cy, eye_width) in the source frame
+        self._mtime = 0.0       # mtime of samples.csv as of the last load
         self.load()
 
     # -- persistence -----------------------------------------------------
@@ -121,29 +150,49 @@ class Dataset:
             self.rows = _migrate_legacy(self.dir)
             if self.rows:
                 self.save()
+        self._mtime = self._disk_mtime()
         self._load_crops()
+
+    def _disk_mtime(self):
+        try:
+            return os.path.getmtime(self.path)
+        except OSError:
+            return 0.0
+
+    def reload_if_changed(self):
+        """Pick up what the other process wrote. Returns True if anything did."""
+        if self._disk_mtime() <= self._mtime:
+            return False
+        self.load()
+        return True
 
     def save(self):
         with open(self.path, "w", newline="") as fh:
             w = csv.DictWriter(fh, fieldnames=FIELDS)
             w.writeheader()
             w.writerows(self.rows)
+        # Our own write must not look like somebody else's.
+        self._mtime = self._disk_mtime()
 
     # -- crops -----------------------------------------------------------
     def _cache_path(self):
         return os.path.join(self.dir, CACHE)
 
     def _load_crops(self, landmarker=None, progress=None):
-        cached = {}
+        cached, geom = {}, {}
         if os.path.exists(self._cache_path()):
             try:
                 z = np.load(self._cache_path(), allow_pickle=False)
                 # Read each array ONCE: NpzFile lookups are lazy, so indexing
                 # inside a comprehension decompresses the archive per sample.
                 names, crops = z["names"], z["crops"]
+                # Older caches predate stored geometry; without it we cannot
+                # re-crop for jitter, so rebuild rather than silently skip it.
+                geoms = z["geom"]
                 cached = {str(n): crops[i] for i, n in enumerate(names)}
+                geom = {str(n): geoms[i] for i, n in enumerate(names)}
             except Exception:
-                cached = {}     # a corrupt cache is never worth failing over
+                cached, geom = {}, {}   # corrupt or old cache: rebuild
 
         wanted = {sample_id(r["frame"], r["side"]) for r in self.rows}
         missing_frames = sorted({r["frame"] for r in self.rows
@@ -163,22 +212,33 @@ class Dataset:
                 if not res.face_landmarks:
                     continue
                 lm = res.face_landmarks[0]
+                gh, gw = g.shape[:2]
                 for side, ring, _tag in SIDES:
-                    crop, _box = make_crop(g, lm, ring)
+                    pts = np.array([[lm[i].x * gw, lm[i].y * gh] for i in ring])
+                    cx, cy = pts[:, 0].mean(), pts[:, 1].mean()
+                    width = pts[:, 0].max() - pts[:, 0].min()
+                    crop, _box = crop_at(g, cx, cy, width)
                     if crop is not None:
-                        cached[sample_id(frame, side)] = crop
+                        sid = sample_id(frame, side)
+                        cached[sid] = crop
+                        geom[sid] = np.array([cx, cy, width], dtype=np.float32)
                 if progress and i % 10 == 0:
                     progress(i, len(missing_frames))
-            self._save_crops(cached)
+            self._save_crops(cached, geom)
 
         self.crops = {k: v for k, v in cached.items() if k in wanted}
+        self.geom = {k: v for k, v in geom.items() if k in wanted}
 
-    def _save_crops(self, cache):
+    def _save_crops(self, cache, geom):
         if not cache:
             return
-        names = sorted(cache)
-        np.savez_compressed(self._cache_path(), names=np.array(names),
-                            crops=np.stack([cache[n] for n in names]))
+        names = sorted(n for n in cache if n in geom)
+        # Uncompressed on purpose: 1ms against 50ms for 0.28MB more on a dataset
+        # of ~700 crops. That is the difference between flushing after every
+        # capture and having to defer it.
+        np.savez(self._cache_path(), names=np.array(names),
+                 crops=np.stack([cache[n] for n in names]),
+                 geom=np.stack([geom[n] for n in names]))
 
     # -- queries ---------------------------------------------------------
     def samples(self):
@@ -189,7 +249,7 @@ class Dataset:
             if sid in self.crops:
                 out.append(dict(id=sid, frame=r["frame"], side=r["side"],
                                 label=r["label"], burst=burst_of(r["frame"]),
-                                crop=self.crops[sid]))
+                                crop=self.crops[sid], geom=self.geom.get(sid)))
         return out
 
     def trainable(self):
@@ -218,19 +278,80 @@ class Dataset:
             self.save()
         return n
 
-    def add_capture(self, gray, label_left, label_right, stamp, index):
-        """Save one captured frame and its two labels."""
+    def add_capture(self, gray, label_left, label_right, stamp, index=0, lm=None):
+        """Save one captured frame and its two labels.
+
+        ``lm`` are the landmarks already computed for this frame by the caller.
+        Passing them lets the crop be derived here instead of re-detecting the
+        face immediately afterwards, which is what makes a capture feel instant.
+        Both the CSV and the crop cache are written straight away, so the web UI
+        sees the sample on its next request.
+        """
         ensure(self.dir)
         frame = f"{stamp}_{index:03d}.png"
         cv2.imwrite(os.path.join(frames_dir(self.dir), frame), gray)
         for side, label in (("img_left", label_left), ("img_right", label_right)):
             self.rows.append({"frame": frame, "side": side, "label": label})
         self.save()
+
+        if lm is not None:
+            h, w = gray.shape[:2]
+            for side, ring, _tag in SIDES:
+                pts = np.array([[lm[i].x * w, lm[i].y * h] for i in ring])
+                cx, cy = pts[:, 0].mean(), pts[:, 1].mean()
+                width = pts[:, 0].max() - pts[:, 0].min()
+                crop, _box = crop_at(gray, cx, cy, width)
+                if crop is not None:
+                    sid = sample_id(frame, side)
+                    self.crops[sid] = crop
+                    self.geom[sid] = np.array([cx, cy, width], dtype=np.float32)
+            self.flush()
         return frame
+
+    def flush(self):
+        """Write the crop cache. Cheap enough to call after every capture."""
+        self._save_crops(self.crops, self.geom)
 
     def refresh_crops(self, landmarker=None):
         """Pick up crops for frames added since load."""
         self._load_crops(landmarker=landmarker)
+
+    def jittered(self, samples, copies, seed=0):
+        """Extra training rows, re-cropped from the source frames at perturbed
+        geometry.
+
+        Re-cropping rather than warping the finished 40x24: a translation applied
+        to the small crop would drag in border padding instead of the pixels that
+        are genuinely next to the eye, teaching the model about the padding.
+
+        Frames are read once each and shared across every sample and copy taken
+        from them.
+        """
+        if copies <= 0:
+            return []
+        rng = np.random.default_rng(seed)
+        by_frame = {}
+        for s in samples:
+            if s.get("geom") is not None:
+                by_frame.setdefault(s["frame"], []).append(s)
+
+        out = []
+        for frame, group in by_frame.items():
+            gray = cv2.imread(os.path.join(frames_dir(self.dir), frame),
+                              cv2.IMREAD_GRAYSCALE)
+            if gray is None:
+                continue
+            for s in group:
+                cx, cy, width = (float(v) for v in s["geom"])
+                for _ in range(copies):
+                    dx, dy = rng.uniform(-JITTER_PX, JITTER_PX, 2)
+                    scale = 1.0 + rng.uniform(-JITTER_SCALE, JITTER_SCALE)
+                    crop, _box = crop_at(gray, cx + dx, cy + dy, width * scale)
+                    if crop is not None:
+                        out.append(dict(id=s["id"], frame=frame, side=s["side"],
+                                        label=s["label"], burst=s["burst"],
+                                        crop=crop, geom=s["geom"]))
+        return out
 
 
 def snapshot_rows(rows):

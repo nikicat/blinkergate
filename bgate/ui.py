@@ -13,8 +13,9 @@ import numpy as np
 S = 2.0                                   # UI scale, set from --scale
 FACE_MODEL = "face_landmarker.task"       # MediaPipe bundle, see fetch_model.py
 
-# MediaPipe FaceMesh contours. RING_L is the LEFT SIDE OF THE IMAGE, which for an
-# unmirrored feed is the subject's right eye.
+# MediaPipe FaceMesh contours. RING_L is the SUBJECT'S LEFT eye, which on an
+# unmirrored feed appears on the RIGHT of the image. Verified against the pixels,
+# not assumed: RING_L centres at x=347 of 640, RING_R at x=307.
 RING_L = [362, 382, 381, 380, 374, 373, 390, 249, 263, 466, 388, 387, 386, 385, 384, 398]
 RING_R = [33, 7, 163, 144, 145, 153, 154, 155, 133, 173, 157, 158, 159, 160, 161, 246]
 # Iris landmarks exist only in the refined 478-point mesh: centre + 4 boundary.
