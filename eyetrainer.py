@@ -29,6 +29,7 @@ right of the strip is the one on the right of the frame.
 """
 
 import argparse
+import os
 import sys
 import time
 
@@ -40,11 +41,13 @@ import numpy as np
 from bgate import data, ui
 from bgate.camera import IRCamera, DEFAULT_DEVICE
 from bgate.data import Dataset
-from bgate.detect import MediaPipeLocator, RollTracker
+from bgate.detect import (BoxedMeshLocator, Cascade, MediaPipeLocator,
+                          RollTracker, YuNetLocator)
 from bgate.model import fit, make_landmarker
 from bgate.registry import Registry
 
 WIN = "blinkergate"
+YUNET_MODEL = "face_detection_yunet.onnx"
 POLL_EVERY = 1.0              # seconds between checks for a generation switch
 CAPTURES = {
     ord("o"): ("both OPEN", data.OPEN, data.OPEN),
@@ -70,6 +73,7 @@ class App:
         self.captured = 0
         self.hard = 0
         self.roll = 0.0
+        self.locator_used = None
         self.pinned = False          # generation chosen here, not in the web UI
         self.blur_override = None    # None = whatever the model was trained with
         self.gens = self.registry.ids()
@@ -269,7 +273,8 @@ class App:
             (state, 0.85,
              (0, 165, 255) if state not in ("open", "no face") else (150, 150, 150)),
             (f"dataset: {counts[data.OPEN]} open / {counts[data.CLOSED]} closed / "
-             f"{counts[data.SKIP]} skip    roll {self.roll:+.0f}deg",
+             f"{counts[data.SKIP]} skip    roll {self.roll:+.0f}deg"
+             + (f"  via {self.locator_used}" if self.locator_used else ""),
              0.45, (200, 200, 120)),
             (self.model_line(), 0.42, self.model_colour()),
             ("o/c/1/2 capture   h hard case   t train   g gen   q quit",
@@ -293,10 +298,20 @@ def main():
     ui.S = args.scale
 
     try:
-        # Roll tracking: face detectors want upright faces, and cancelling the
-        # tracked head roll took detection from 67% to 93% on the frames that
-        # were failing. The angle is tracked, so it is usually one detect.
-        locator = RollTracker(MediaPipeLocator(make_landmarker()))
+        # Two locators, tried in order, because they fail in different places.
+        # Roll-compensated mesh handles a tilted head (72% of the hard frames);
+        # YuNet finds the face in dark low-contrast ones the mesh drops, and the
+        # mesh then runs inside its box so the landmarks - and therefore the crop
+        # convention - stay the mesh's own. Together 77%, against 49% for the
+        # plain mesh.
+        mesh = MediaPipeLocator(make_landmarker())
+        stages = [RollTracker(MediaPipeLocator(make_landmarker()))]
+        if os.path.exists(YUNET_MODEL):
+            stages.append(BoxedMeshLocator(
+                YuNetLocator(YUNET_MODEL, (640, 360)), mesh))
+        else:
+            print(f"{YUNET_MODEL} missing - run: uv run fetch_model.py")
+        locator = Cascade(stages)
     except FileNotFoundError as exc:
         sys.exit(str(exc))
 
@@ -324,7 +339,9 @@ def main():
 
         app.poll()
         det = locator.locate(gray)
-        app.roll = locator.angle if det else app.roll
+        if det:
+            app.roll = locator.angle
+            app.locator_used = locator.used
 
         cv2.imshow(WIN, app.render(gray, det))
         key = cv2.waitKey(1) & 0xFF

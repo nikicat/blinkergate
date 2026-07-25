@@ -335,3 +335,97 @@ class RollTracker:
                     self.angle = measured
                 return det
         return None
+
+
+class BoxedMeshLocator:
+    """Find the face with one detector, then run the mesh inside that box.
+
+    The mesh is the only thing that gives eyelid contours and iris landmarks, so
+    the crops it produces are the ones the model was trained on. Using a second
+    detector merely to say *where* to look keeps that intact - unlike taking the
+    second detector's own eye keypoints, whose crops agreed with the mesh on only
+    80% of verdicts.
+
+    It also makes the mesh's job easier: a face that is small and low-contrast in
+    the full frame becomes large and centred once its box is cropped and upscaled.
+    Measured on 88 frames where detection was struggling, the mesh succeeded
+    inside every single box the proposer found.
+    """
+
+    name = "boxed-mesh"
+    MARGIN = 0.45       # of the box size, added on every side
+    TARGET = 256        # upscale the crop to about this, if it is smaller
+
+    def __init__(self, proposer, mesh):
+        self.proposer = proposer
+        self.mesh = mesh
+
+    def locate(self, gray):
+        proposal = self.proposer.locate(gray)
+        if not proposal or not proposal.box:
+            return None
+        h, w = gray.shape[:2]
+        x, y, bw, bh = proposal.box
+        cx, cy = x + bw / 2, y + bh / 2
+        half = max(bw, bh) * (0.5 + self.MARGIN)
+        x0, y0 = int(max(0, cx - half)), int(max(0, cy - half))
+        x1, y1 = int(min(w, cx + half)), int(min(h, cy + half))
+        if x1 <= x0 + 4 or y1 <= y0 + 4:
+            return None
+
+        roi = gray[y0:y1, x0:x1]
+        scale = self.TARGET / max(roi.shape[:2])
+        if scale > 1:
+            roi = cv2.resize(roi, None, fx=scale, fy=scale,
+                             interpolation=cv2.INTER_CUBIC)
+        else:
+            scale = 1.0
+
+        det = self.mesh.locate(roi)
+        if not det:
+            return None
+
+        # Back to full-frame normalised coordinates.
+        rh, rw = roi.shape[:2]
+        landmarks = [_Landmark((x0 + l.x * rw / scale) / w,
+                               (y0 + l.y * rh / scale) / h, l.z)
+                     for l in det.landmarks]
+        eyes = {}
+        for side, ring in RINGS.items():
+            pts = np.array([[landmarks[i].x * w, landmarks[i].y * h] for i in ring])
+            eyes[side] = Eye(pts[:, 0].mean(), pts[:, 1].mean(),
+                             pts[:, 0].max() - pts[:, 0].min())
+        return Detection(self.name, eyes, landmarks=landmarks, box=proposal.box)
+
+
+class Cascade:
+    """Try locators in order and take the first that finds a face.
+
+    They fail in different places: roll-compensated mesh handles a tilted head
+    but not a dark low-contrast one; YuNet handles the dark frame but not the
+    tilt. Measured on 88 hard frames - 72% and 44% alone, 77% together.
+    """
+
+    def __init__(self, locators):
+        self.locators = list(locators)
+        self.used = None        # which one answered on the last frame
+
+    def locate(self, gray):
+        for loc in self.locators:
+            try:
+                det = loc.locate(gray)
+            except Exception:
+                det = None
+            if det:
+                self.used = getattr(loc, "name", type(loc).__name__)
+                return det
+        self.used = None
+        return None
+
+    @property
+    def angle(self):
+        """Roll tracked by whichever member tracks it, for display."""
+        for loc in self.locators:
+            if isinstance(loc, RollTracker):
+                return loc.angle
+        return 0.0
