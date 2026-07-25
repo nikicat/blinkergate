@@ -110,7 +110,11 @@ class YuNetLocator:
 
     name = "yunet"
 
-    def __init__(self, model_path, size, score_threshold=0.6):
+    # 0.6 rejected faces that are plainly there; 0.3 finds them with no false
+    # positive on any of 39 faceless inputs.
+    DEFAULT_SCORE = 0.3
+
+    def __init__(self, model_path, size, score_threshold=DEFAULT_SCORE):
         self.model_path = model_path
         self._size = None
         self.detector = cv2.FaceDetectorYN_create(model_path, "", size,

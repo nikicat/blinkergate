@@ -60,7 +60,17 @@ BLUR_SIGMA = 1.6
 NORMALISE = "standardise"
 
 
-def make_landmarker(model_path=None):
+# The detector inside the landmarker bundle, not the mesh, is what rejects a
+# tilted or low-contrast face. At the default 0.5 it found 49% of the frames
+# captured because detection was struggling; at 0.2 that is 74%, and 100% once
+# roll compensation is applied. It costs nothing measurable: accuracy on ordinary
+# frames went 99.2% -> 99.6%, and across 39 faceless inputs (sensor noise, flat
+# fields, real frames with the face blanked out) there were zero false positives
+# at any threshold down to 0.1.
+DETECTION_CONFIDENCE = 0.2
+
+
+def make_landmarker(model_path=None, confidence=DETECTION_CONFIDENCE):
     """MediaPipe face landmarker in IMAGE mode.
 
     IMAGE, not VIDEO: VIDEO seeds each frame from the previous one, which damps
@@ -77,7 +87,8 @@ def make_landmarker(model_path=None):
     return vision.FaceLandmarker.create_from_options(
         vision.FaceLandmarkerOptions(
             base_options=mp_python.BaseOptions(model_asset_path=path),
-            running_mode=vision.RunningMode.IMAGE, num_faces=1))
+            running_mode=vision.RunningMode.IMAGE, num_faces=1,
+            min_face_detection_confidence=confidence))
 
 
 def features(crops, blur=BLUR_SIGMA, normalise=NORMALISE):
