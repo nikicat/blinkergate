@@ -287,6 +287,8 @@ def main():
     ap.add_argument("--scale", type=float, default=2.0, help="UI scale")
     ap.add_argument("--thresh", type=float, default=0.5,
                     help="P(open) below this counts as shut")
+    ap.add_argument("--subtract", action="store_true",
+                    help="subtract the unlit strobe frame to cancel ambient IR")
     args = ap.parse_args()
     ui.S = args.scale
 
@@ -300,12 +302,13 @@ def main():
 
     app = App(args)
     try:
-        cam = IRCamera(args.device)
+        cam = IRCamera(args.device, subtract=args.subtract)
     except RuntimeError as exc:
         sys.exit(str(exc))
 
     counts = app.dataset.counts()
-    print(f"strobe cutoff {cam.lit_cutoff:.1f}   dataset {sum(counts.values())} samples")
+    print(f"strobe cutoff {cam.lit_cutoff:.1f}   dataset {sum(counts.values())} samples"
+          + ("   ambient subtraction ON" if args.subtract else ""))
     print(f"{app.status}\nlabel and manage generations at:  uv run serve.py\n")
 
     cv2.namedWindow(WIN, cv2.WINDOW_NORMAL)

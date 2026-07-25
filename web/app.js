@@ -45,6 +45,12 @@ function sortKey(mode) {
                        uncertainty(a) - uncertainty(b);
     case "burst":
       return (a, b) => a.burst.localeCompare(b.burst) || a.id.localeCompare(b.id);
+    // Groups each eye together: one eye is often harder than the other, and
+    // that is invisible while they are interleaved.
+    case "eye":
+      return (a, b) => a.side.localeCompare(b.side) ||
+                       a.label.localeCompare(b.label) ||
+                       a.id.localeCompare(b.id);
     case "newest":
       return (a, b) => b.frame.localeCompare(a.frame);
     default:
@@ -58,7 +64,9 @@ function uncertainty(s) {
 
 function visible() {
   const f = $("#filter").value;
+  const eye = $("#eye").value;
   let rows = state.samples;
+  if (eye !== "all") rows = rows.filter((s) => s.side === eye);
   if (f === "trainable") rows = rows.filter((s) => s.label !== "skip");
   else if (f === "conflict") rows = rows.filter(conflicts);
   else if (f !== "all") rows = rows.filter((s) => s.label === f);
@@ -93,13 +101,24 @@ function render() {
   updateCounts();
 }
 
-function updateCounts() {
+function tally(rows) {
   const c = { open: 0, closed: 0, skip: 0 };
-  state.samples.forEach((s) => { c[s.label] = (c[s.label] || 0) + 1; });
+  rows.forEach((s) => { c[s.label] = (c[s.label] || 0) + 1; });
+  return c;
+}
+
+function updateCounts() {
+  const c = tally(state.samples);
   const bad = state.samples.filter(conflicts).length;
+  // Per eye as well as overall: an imbalance between the two is worth seeing,
+  // because a model can be fine on one eye and poor on the other.
+  const perEye = ["img_left", "img_right"].map((side) => {
+    const t = tally(state.samples.filter((s) => s.side === side));
+    return `${side === "img_left" ? "L" : "R"} ${t.open}/${t.closed}`;
+  }).join(" · ");
   $("#summary").textContent =
     `${state.samples.length} samples · ${c.open} open · ${c.closed} closed · ` +
-    `${c.skip} skip · ${bad} disagree` +
+    `${c.skip} skip · ${bad} disagree · open/closed per eye ${perEye}` +
     (state.activeGeneration ? ` · active ${state.activeGeneration}` : " · no model");
   $("#selcount").textContent = `${state.selected.size} selected`;
 }
@@ -208,6 +227,7 @@ document.querySelectorAll(".label-btn").forEach((b) => {
 });
 $("#sort").onchange = render;
 $("#filter").onchange = () => { state.lastIndex = null; render(); };
+$("#eye").onchange = () => { state.lastIndex = null; render(); };
 $("#sel-all").onclick = () => {
   state.shown.forEach((s) => state.selected.add(s.id));
   render();
