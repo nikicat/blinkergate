@@ -275,10 +275,20 @@ class RollTracker:
         self.name = getattr(locator, "name", "locator")
 
     def _candidates(self):
-        """Tracked angle first, then level, then the sweep - each only once."""
+        """Level FIRST, then the tracked angle, then the sweep - each only once.
+
+        Trying the tracked angle first is self-reinforcing and drifts: rotating by
+        a remembered angle makes the mesh fit the rotated image, which then
+        measures roughly the angle that was applied, which is stored as the new
+        truth. Measured over 180 frames it invented rolls up to 35 degrees off,
+        each frame handing its error to the next.
+
+        An unrotated fit cannot be wrong that way, so it is always tried first and
+        rotation is left to rescue the frames where it genuinely fails.
+        """
         tracked = 0.0 if abs(self.angle) < self.DEADZONE else self.angle
         out, seen = [], set()
-        for angle in (tracked, 0.0, *self.sweep):
+        for angle in (0.0, tracked, *self.sweep):
             key = round(angle, 1)
             if key not in seen and abs(angle) <= self.MAX_ANGLE:
                 seen.add(key)
