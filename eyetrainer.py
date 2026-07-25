@@ -10,6 +10,7 @@ and this picks it up within a second, without a restart.
 
   o  both open          c  both closed
   1  YOUR LEFT shut     2  YOUR RIGHT shut       (one frame per press)
+  h  save this frame as a detector test case (press when it says NO FACE)
   t  train a new generation from the current dataset
   g  cycle generation: follow-the-web-UI, then each one in turn
   b  override the blur (diagnostic - see below)
@@ -39,6 +40,7 @@ import numpy as np
 from bgate import data, ui
 from bgate.camera import IRCamera, DEFAULT_DEVICE
 from bgate.data import Dataset
+from bgate.detect import MediaPipeLocator, RollTracker
 from bgate.model import fit, make_landmarker
 from bgate.registry import Registry
 
@@ -66,6 +68,8 @@ class App:
         self.last_poll = 0.0
         self.status = ""
         self.captured = 0
+        self.hard = 0
+        self.roll = 0.0
         self.pinned = False          # generation chosen here, not in the web UI
         self.blur_override = None    # None = whatever the model was trained with
         self.gens = self.registry.ids()
@@ -154,21 +158,33 @@ class App:
             self.load_model()
             print(f"  switched to {self.model_gen}")
 
-    def capture(self, gray, res, name, label_left, label_right):
+    def capture(self, gray, det, name, label_left, label_right):
         """One frame, now. Holding a pose for a burst produced ~15 near-identical
         frames worth about one frame of information (measured: training on 1 per
         press scored 88.1% against 86.5% for all 15), so a press takes exactly
         the frame you pressed on."""
-        if not res.face_landmarks:
+        if not det:
             self.status = f"{name}: no face - nothing captured"
             return
         stamp = int(time.time() * 1000)
         self.dataset.add_capture(gray, label_left, label_right, stamp,
-                                 lm=res.face_landmarks[0])
+                                 lm=det.landmarks)
         self.captured += 1
         counts = self.dataset.counts()
         self.status = (f"captured {name}  ({self.captured} this session, "
                        f"{counts[data.OPEN]}/{counts[data.CLOSED]} open/closed)")
+        print(f"  {self.status}")
+
+    def capture_hard(self, gray, det):
+        """Record a frame the detector should have handled.
+
+        Captures whether or not a face was found - the failures are the whole
+        point, and the ordinary capture path refuses exactly those.
+        """
+        frame = self.dataset.add_detector_case(gray, bool(det))
+        self.hard += 1
+        found = "found" if det else "NO FACE"
+        self.status = f"detector case {self.hard} saved ({found}): {frame}"
         print(f"  {self.status}")
 
     def train(self):
@@ -216,15 +232,15 @@ class App:
             return (0, 0, 255)      # a mismatched blur is not a valid reading
         return (0, 200, 255)
 
-    def render(self, gray, res):
+    def render(self, gray, det):
         raw = cv2.cvtColor(ui.enlarge(gray), cv2.COLOR_GRAY2BGR)
         annot = raw.copy()
         state = "no face"
         blank = np.zeros((int(ui.INSET_H * ui.S), int(ui.INSET_W * ui.S), 3), np.uint8)
         insets = [blank, blank]
 
-        if res.face_landmarks and self.model:
-            lm = res.face_landmarks[0]
+        if det and self.model:
+            lm = det.landmarks
             probs, _crops, boxes = self.model.eyes(gray, lm)
             shut = [p is not None and p < self.args.thresh for p in probs]
             for box, is_shut in zip(boxes, shut):
@@ -253,9 +269,10 @@ class App:
             (state, 0.85,
              (0, 165, 255) if state not in ("open", "no face") else (150, 150, 150)),
             (f"dataset: {counts[data.OPEN]} open / {counts[data.CLOSED]} closed / "
-             f"{counts[data.SKIP]} skip", 0.45, (200, 200, 120)),
+             f"{counts[data.SKIP]} skip    roll {self.roll:+.0f}deg",
+             0.45, (200, 200, 120)),
             (self.model_line(), 0.42, self.model_colour()),
-            ("o both  c both-shut  1 your-left  2 your-right   t train  g gen  q quit",
+            ("o/c/1/2 capture   h hard case   t train   g gen   q quit",
              0.38, (150, 150, 150)),
         ])
         return np.vstack([top, band])
@@ -274,7 +291,10 @@ def main():
     ui.S = args.scale
 
     try:
-        landmarker = make_landmarker()
+        # Roll tracking: face detectors want upright faces, and cancelling the
+        # tracked head roll took detection from 67% to 93% on the frames that
+        # were failing. The angle is tracked, so it is usually one detect.
+        locator = RollTracker(MediaPipeLocator(make_landmarker()))
     except FileNotFoundError as exc:
         sys.exit(str(exc))
 
@@ -288,7 +308,6 @@ def main():
     print(f"strobe cutoff {cam.lit_cutoff:.1f}   dataset {sum(counts.values())} samples")
     print(f"{app.status}\nlabel and manage generations at:  uv run serve.py\n")
 
-    import mediapipe as mp
     cv2.namedWindow(WIN, cv2.WINDOW_NORMAL)
     cv2.resizeWindow(WIN, int(1280 * ui.S), int(600 * ui.S))
     fullscreen = False
@@ -301,10 +320,10 @@ def main():
             continue
 
         app.poll()
-        res = landmarker.detect(mp.Image(image_format=mp.ImageFormat.SRGB,
-                                         data=cv2.cvtColor(gray, cv2.COLOR_GRAY2RGB)))
+        det = locator.locate(gray)
+        app.roll = locator.angle if det else app.roll
 
-        cv2.imshow(WIN, app.render(gray, res))
+        cv2.imshow(WIN, app.render(gray, det))
         key = cv2.waitKey(1) & 0xFF
         if key == ord("q"):
             break
@@ -315,8 +334,10 @@ def main():
             app.cycle_generation()
         elif key == ord("b"):
             app.cycle_blur()
+        elif key == ord("h"):
+            app.capture_hard(gray, det)
         elif key in CAPTURES:
-            app.capture(gray, res, *CAPTURES[key])
+            app.capture(gray, det, *CAPTURES[key])
         elif key in (ord("+"), ord("=")):
             ui.S = min(ui.S + 0.25, 4.0)
             cv2.resizeWindow(WIN, int(1280 * ui.S), int(600 * ui.S))

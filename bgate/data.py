@@ -20,6 +20,7 @@ labels it was trained on.
 
 import csv
 import os
+import time
 
 import cv2
 import numpy as np
@@ -42,6 +43,12 @@ LABELS = (OPEN, CLOSED, SKIP)
 TRAINABLE = (OPEN, CLOSED)
 
 SAMPLES_CSV = "samples.csv"
+# Frames captured because a detector FAILED on them. They carry no eye labels -
+# there are no eye positions to crop - so they live in their own manifest and are
+# never part of classifier training. Ground truth is "a face is present", which
+# you assert by pressing the key.
+DETECTOR_CSV = "detector.csv"
+DETECTOR_FIELDS = ["frame", "mediapipe", "note"]
 LEGACY_CSV = "labels.csv"          # one row per frame, img_left / img_right columns
 CACHE = ".crops.npz"
 FIELDS = ["frame", "side", "label"]
@@ -311,6 +318,43 @@ class Dataset:
     def flush(self):
         """Write the crop cache. Cheap enough to call after every capture."""
         self._save_crops(self.crops, self.geom)
+
+    # -- detector test cases ---------------------------------------------
+    def detector_path(self):
+        return os.path.join(self.dir, DETECTOR_CSV)
+
+    def add_detector_case(self, gray, detected, note=""):
+        """Save a frame that a detector should have found a face in.
+
+        Deliberately separate from the labelled samples: this is a benchmark for
+        *locating* the eyes, and a frame is only interesting here when locating
+        failed - which is exactly when there is nothing to label.
+        """
+        ensure(self.dir)
+        # A millisecond stamp alone collides when two land in the same one, which
+        # silently overwrites the earlier frame. Suffix until the name is free.
+        base = int(time.time() * 1000)
+        n = 0
+        while True:
+            frame = f"hard_{base}_{n:02d}.png"
+            if not os.path.exists(os.path.join(frames_dir(self.dir), frame)):
+                break
+            n += 1
+        cv2.imwrite(os.path.join(frames_dir(self.dir), frame), gray)
+        new = not os.path.exists(self.detector_path())
+        with open(self.detector_path(), "a", newline="") as fh:
+            w = csv.DictWriter(fh, fieldnames=DETECTOR_FIELDS)
+            if new:
+                w.writeheader()
+            w.writerow({"frame": frame, "mediapipe": int(bool(detected)), "note": note})
+        return frame
+
+    def detector_cases(self):
+        try:
+            with open(self.detector_path()) as fh:
+                return list(csv.DictReader(fh))
+        except OSError:
+            return []
 
     def refresh_crops(self, landmarker=None):
         """Pick up crops for frames added since load."""

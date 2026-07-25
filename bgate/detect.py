@@ -20,6 +20,7 @@ That calibration is learned online rather than hardcoded, because it depends on
 the camera and on where you sit.
 """
 
+import math
 from collections import deque
 
 import cv2
@@ -217,3 +218,119 @@ class DualLocator:
                 arr = np.array(hist)
                 out[side] = float(np.median(np.hypot(arr[:, 0], arr[:, 1])))
         return out
+
+
+class _Landmark:
+    """A landmark mapped back into the original frame's coordinates.
+
+    MediaPipe's own objects are read-only, so rotating the image means rebuilding
+    them - cheap for 478 points, and it keeps everything downstream (crops, iris
+    circles, the eyelid contours the UI draws) working on unrotated coordinates
+    exactly as before.
+    """
+
+    __slots__ = ("x", "y", "z")
+
+    def __init__(self, x, y, z=0.0):
+        self.x, self.y, self.z = float(x), float(y), float(z)
+
+
+def roll_of(eyes):
+    """In-plane head roll in degrees, from the line between the eye centres.
+    0 is level; positive means the subject's left eye sits lower in the image."""
+    a, b = eyes.get("img_right"), eyes.get("img_left")
+    if a is None or b is None:
+        return None
+    return math.degrees(math.atan2(b.cy - a.cy, b.cx - a.cx))
+
+
+class RollTracker:
+    """Wraps a locator and cancels head roll before asking it to detect.
+
+    Face detectors are trained on upright faces. Measured on 43 frames where
+    detection was struggling, rotating to upright took MediaPipe from 67% to 93%.
+
+    The angle is *tracked*, not swept: once the head is found at some roll, the
+    next frame almost certainly has a similar one, so the usual cost is a single
+    detection. The sweep only runs after the tracked angle and level have both
+    failed, which is when a frame is being lost anyway.
+    """
+
+    SWEEP = (-20.0, 20.0, -35.0, 35.0)
+    MAX_ANGLE = 50.0
+    # Below this the correction is not worth a warpAffine; measured roll on a
+    # roughly level head wanders by a degree or two frame to frame.
+    DEADZONE = 3.0
+
+    def __init__(self, locator, sweep=SWEEP):
+        self.locator = locator
+        self.sweep = sweep
+        self.angle = 0.0          # last roll that worked
+        self.last_used = 0.0      # rotation applied on the last successful frame
+        self.name = getattr(locator, "name", "locator")
+
+    def _candidates(self):
+        """Tracked angle first, then level, then the sweep - each only once."""
+        tracked = 0.0 if abs(self.angle) < self.DEADZONE else self.angle
+        out, seen = [], set()
+        for angle in (tracked, 0.0, *self.sweep):
+            key = round(angle, 1)
+            if key not in seen and abs(angle) <= self.MAX_ANGLE:
+                seen.add(key)
+                out.append(angle)
+        return out
+
+    @staticmethod
+    def _rotate(gray, angle):
+        h, w = gray.shape[:2]
+        m = cv2.getRotationMatrix2D((w / 2, h / 2), angle, 1.0)
+        return cv2.warpAffine(gray, m, (w, h), flags=cv2.INTER_LINEAR,
+                              borderMode=cv2.BORDER_REPLICATE), m
+
+    @staticmethod
+    def _unrotate(det, m, shape):
+        """Map a detection made on the rotated image back to the original."""
+        h, w = shape[:2]
+        inv = cv2.invertAffineTransform(m)
+
+        def back(px, py):
+            return (inv[0, 0] * px + inv[0, 1] * py + inv[0, 2],
+                    inv[1, 0] * px + inv[1, 1] * py + inv[1, 2])
+
+        eyes = {}
+        for side, eye in det.eyes.items():
+            x, y = back(eye.cx, eye.cy)
+            eyes[side] = Eye(x, y, eye.width)      # rotation does not change scale
+
+        landmarks = det.landmarks
+        if landmarks is not None:
+            pts = np.array([[l.x * w, l.y * h, 1.0] for l in landmarks])
+            mapped = pts @ inv.T
+            landmarks = [_Landmark(px / w, py / h, l.z)
+                         for (px, py), l in zip(mapped, landmarks)]
+        return Detection(det.source, eyes, landmarks=landmarks, box=det.box)
+
+    def locate(self, gray):
+        for angle in self._candidates():
+            if angle == 0.0:
+                det = self.locator.locate(gray)
+                if det:
+                    self.last_used = 0.0
+                    measured = roll_of(det.eyes)
+                    if measured is not None:
+                        self.angle = measured
+                    return det
+                continue
+
+            rotated, m = self._rotate(gray, angle)
+            det = self.locator.locate(rotated)
+            if det:
+                det = self._unrotate(det, m, gray.shape)
+                self.last_used = angle
+                measured = roll_of(det.eyes)
+                # Track what the face actually is, not the angle that happened to
+                # work, so the next frame starts from the truth.
+                if measured is not None:
+                    self.angle = measured
+                return det
+        return None
