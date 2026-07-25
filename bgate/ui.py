@@ -7,6 +7,8 @@ itself, which is enlarged nearest-neighbour: it should look pixelated, because
 that is honestly how little data the decision rests on.
 """
 
+import math
+
 import cv2
 import numpy as np
 
@@ -45,6 +47,49 @@ def iris_circle(shape, lm, iris):
     p = np.array([[lm[i].x * w, lm[i].y * h] for i in iris])
     c = p[0]
     return float(c[0]), float(c[1]), max(float(np.linalg.norm(p[1:] - c, axis=1).mean()), 1.5)
+
+
+def face_quad(lm, w, h, roll=0.0, pad=0.06):
+    """Corners of a box around the face, tilted with the head.
+
+    Measured in the levelled frame and rotated back, so the box follows your roll
+    instead of growing as you tilt - which also makes the tracked roll visible.
+    """
+    pts = np.array([[l.x * w, l.y * h] for l in lm])
+    cx, cy = pts[:, 0].mean(), pts[:, 1].mean()
+    theta = math.radians(-roll)
+    cos, sin = math.cos(theta), math.sin(theta)
+    rel = pts - (cx, cy)
+    level = np.stack([rel[:, 0] * cos - rel[:, 1] * sin,
+                      rel[:, 0] * sin + rel[:, 1] * cos], axis=1)
+    x0, y0 = level.min(0)
+    x1, y1 = level.max(0)
+    mx, my = (x1 - x0) * pad, (y1 - y0) * pad
+    corners = np.array([[x0 - mx, y0 - my], [x1 + mx, y0 - my],
+                        [x1 + mx, y1 + my], [x0 - mx, y1 + my]])
+    back = np.stack([corners[:, 0] * cos + corners[:, 1] * sin,
+                     -corners[:, 0] * sin + corners[:, 1] * cos], axis=1)
+    return (back + (cx, cy)).astype(np.int32)
+
+
+def draw_face_frame(img, lm, roll=0.0, colour=(0, 200, 255), label=None):
+    """The face frame, drawn on an already-enlarged image."""
+    h, w = img.shape[:2]
+    quad = face_quad(lm, w, h, roll)
+    cv2.polylines(img, [quad], True, colour, max(1, int(round(S * 0.6))), cv2.LINE_AA)
+    # Corner ticks, so the frame reads as a frame rather than as a shape in the
+    # scene - the IR image is busy and a plain rectangle disappears into it.
+    for i, corner in enumerate(quad):
+        nxt = quad[(i + 1) % 4]
+        vec = (nxt - corner).astype(np.float32)
+        vec /= max(np.linalg.norm(vec), 1e-6)
+        tip = (corner + vec * (np.linalg.norm(nxt - corner) * 0.22)).astype(np.int32)
+        cv2.line(img, tuple(corner), tuple(tip), colour,
+                 max(2, int(round(S))), cv2.LINE_AA)
+    if label:
+        txt(img, label, (int(quad[:, 0].min()), int(quad[:, 1].min()) - int(6 * S)),
+            0.42, colour, 1.2)
+    return quad
 
 
 def eye_inset(gray, lm, ring, iris, title, p_open, shut, extra=None):

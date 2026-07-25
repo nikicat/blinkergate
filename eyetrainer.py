@@ -243,6 +243,10 @@ class App:
         blank = np.zeros((int(ui.INSET_H * ui.S), int(ui.INSET_W * ui.S), 3), np.uint8)
         insets = [blank, blank]
 
+        if det and det.landmarks is not None:
+            ui.draw_face_frame(annot, det.landmarks, det.roll,
+                               label=f"{self.locator_used or ''} {det.roll:+.0f}deg".strip())
+
         if det and self.model:
             lm = det.landmarks
             probs, _crops, boxes = self.model.eyes(gray, lm, roll=det.roll)
