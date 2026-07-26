@@ -89,6 +89,43 @@ open and closed, so the crop is not systematically framed low. Worth having
 measured, because it is a constant offset and the synthetic roll sweep is blind to
 constants by construction.
 
+### Where the pupil actually is
+
+Measured independently of the mesh, by finding the bright disc directly with a
+scale-normalised Laplacian of Gaussian, over 636 confident detections. Offsets are
+in the levelled frame, so they are the shift the crop actually suffers.
+
+| | mean | sd | p50 | p90 | p99 | max |
+|---|---|---|---|---|---|---|
+| dx | −0.39 | 1.93 | −0.17 | 1.50 | 4.50 | 6.00 |
+| dy | −1.38 | 0.89 | −1.33 | −0.50 | 0.94 | 3.00 |
+| \|d\| | 2.20 | 1.33 | 1.82 | 3.68 | 6.70 | **9.94** |
+
+**Re-centring the crop does not fix it.** There is a real vertical bias — the
+pupil sits 1.4 px above the crop centre — but removing it moves the median from
+1.82 px to 1.17 px and the fraction past the 4 px cliff from 8.8% to 8.6%. The
+dominant term is horizontal scatter of sd 1.9 px, and that is **gaze**: where the
+subject is looking inside their own eye socket. No detector can remove it, because
+it is not a detection error. That is the case for shift invariance in the
+classifier rather than more work on the geometry.
+
+**It is the same for both eyes** (img_left dx −0.64 ± 2.02, img_right −0.13 ±
+1.81), so there is no per-eye correction to make.
+
+**The crop is already wide enough.** 0 of 636 pupils fell outside the current
+`PAD_W = 1.6` crop, and the worst offset in the dataset is 9.94 px. Pooling has
+the margin it needs without widening anything.
+
+Two controls, because a blob detector always returns a maximum: on closed eyes the
+response is 0.68 median against 1.90 for open (76% of open above the pooled
+median, 4% of closed), and the blob agrees with the mesh's own iris landmark to a
+median of 1.8 px with 86% inside 4 px. Where the two *disagree* the crop is
+mislocated; where they agree and the pupil is still off-centre, that is gaze.
+
+**13% of open eyes have no confident pupil at all** — low contrast, nothing for a
+blob detector to find. A model keyed on the pupil alone would abstain on one open
+eye in eight, which is why the ridge channel is not optional.
+
 **Blendshapes carry a left/right bias on grayscale IR** — `eyeBlinkLeft` reads
 about 2× `eyeBlinkRight` at rest (0.132 vs 0.063) and during *symmetric* both-eye
 closure (0.598 vs 0.359). Fatal for any differential L−R decision.
@@ -133,6 +170,13 @@ moves or rescales the content:
 
 Graceful to ~3 px, then a cliff. Every source of geometry noise — head pose,
 distance, a different detector — lands there.
+
+> **These numbers do not state a shift direction, and the direction matters more
+> than anything else in the table.** Re-measured, the same model reads 75.4% at
+> 4 px shifted horizontally and **44.2%** shifted in a random direction. The crop
+> is 29 source px wide but only 17 tall, so a vertical shift is proportionally
+> 1.7× the insult. Assume the tables in this section are the horizontal, gentler
+> case. `pooled_eval.py --direction` measures either.
 
 **Three fixes, all measured, all carried inside the model** (a model fitted one
 way is meaningless applied another, so `blur`, `normalise` and `roll_levelled`
@@ -185,6 +229,91 @@ deliberately, at training *and* inference, is the version that works.
 
 The hook is kept in `fit(augment=...)`, off, so the measurement can be repeated —
 not because it is recommended.
+
+**That reasoning stops applying the moment there is pooling.** "Invariance needs
+pooling, which a linear model does not have" is a statement about the *pixel*
+model. Do not carry the anti-augmentation conclusion over to the pooled one
+without re-measuring it.
+
+---
+
+## Pooling, instead of a template
+
+A linear model can encode "bright **here**". It cannot encode "bright **anywhere
+near here**" — that needs a maximum over positions, and a sum is not a maximum.
+Every geometry fix above is a prosthetic for that missing operation.
+
+`bgate/pooled.py` supplies it: convolve a kernel over every position, take the
+maximum of the response map, feed those maxima to the same logistic layer. Move
+the pupil and the peak moves with it; the maximum does not change.
+
+Two channels, which are the two things visible in an IR eye crop — a bright disc
+with a darker ring (Laplacian of Gaussian) and a dark elongated bar (an
+anisotropic ridge filter, at three orientations because an arc is locally a
+tilted line). Both start at their textbook shapes and are then fitted.
+
+Scored on deliberate crop shifts, random direction, whole bursts held out:
+
+| model | 0 px | 2 px | 3 px | 4 px | 6 px | 8 px |
+|---|---|---|---|---|---|---|
+| pixel template | 96.3% | 79.3% | 56.3% | 44.2% | 46.3% | 54.0% |
+| pooled, fixed kernels | 99.4% | 98.3% | 98.1% | 95.6% | 81.4% | 68.5% |
+| **pooled, learned kernels** | **99.5%** | **99.4%** | **99.1%** | **98.3%** | **94.4%** | **82.4%** |
+
+And on real head roll, where the geometry is re-derived from a rotated frame
+rather than perturbed by a known amount (`roll_sweep.py --score`):
+
+| geometry | model | −35° | −20° | 0° | +20° | +35° |
+|---|---|---|---|---|---|---|
+| as found | pixel | 62.4% | 83.3% | 95.1% | 81.6% | 74.2% |
+| as found | pooled | 88.6% | 97.1% | 99.7% | 94.8% | 93.2% |
+| refit/level | pixel | 86.1% | 94.0% | 96.0% | 90.9% | 88.6% |
+| refit/level | **pooled** | **92.1%** | **98.6%** | **99.8%** | **97.9%** | **93.8%** |
+
+**Learning the kernels earns its place**, which was the open question: +2.7 points
+at 4 px, +13 at 6 px, +14 at 8 px over the textbook bank. Max-pooling makes the
+backward pass trivial — only the winning position contributed — so this is numpy
+and an Adam loop, not a framework.
+
+It is also *smaller*: 621 weights against 961. The "a convnet needs more data"
+caution is about stacked layers; one learned filter bank with global max-pooling
+has fewer parameters than the model it replaces.
+
+**Pooling substitutes for most of the geometry work.** The pooled model on raw
+geometry — no levelling refit, no levelled width — beats the pixel model *with*
+the full geometry stack at every roll angle. Both attack the same failure, so
+credit for it cannot be claimed twice. The geometry fixes still stack (88.6% →
+92.1% at −35°) and they still fix *detection*, which pooling cannot touch: a face
+that is not found has no crop to pool over.
+
+### Two guards that are not optional
+
+**Kernels are held zero-mean and unit-norm**, re-projected every step. Zero-mean
+so a flat region scores exactly 0 — otherwise the pooling maximum locks onto the
+brightest patch of cheek. Unit-norm so a kernel cannot inflate its own feature,
+leaving the logistic layer fitting a scale it does not control.
+
+**A negative control, because 99.5% deserves disbelief.** With the labels
+permuted there is nothing to learn, so anything above the majority class means the
+harness leaks. Measured: pixel 59.9%, pooled-fixed 57.0%, pooled-learned 62.9%,
+against a 63.7% majority. `pooled_eval.py --shuffle`.
+
+### The ablation is not clean, and says so
+
+| bank | 0 px | 4 px | 6 px | 8 px |
+|---|---|---|---|---|
+| blobs only (2 kernels) | 99.4% | 96.9% | 86.8% | 74.1% |
+| ridges only (3 kernels) | 99.8% | 98.2% | 87.8% | 74.0% |
+| both (5) | 99.5% | 98.3% | **94.4%** | **82.4%** |
+
+Ridges edging ahead of blobs is **not** a finding — 3 kernels against 2, not
+parameter-matched. What is solid: both channels together beat either alone by 7–8
+points in the tail.
+
+The learned kernels muddy it further. The blobs stayed blobs (0.70 and 0.83 of
+unit norm from where they started) but the ridges moved 1.31–1.52 and two of the
+three visibly stopped being bars. Given spare capacity the fit spends it on blob
+detectors.
 
 ---
 

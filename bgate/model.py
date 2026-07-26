@@ -174,58 +174,19 @@ def fit(samples, augment=None, blur=BLUR_SIGMA, normalise=NORMALISE):
     return coef, intercept, accuracy
 
 
-class EyeModel:
-    """Loaded classifier. ``predict`` returns P(open) per crop."""
+class CropSource:
+    """Cuts the crops a classifier reads.
 
-    def __init__(self, coef, intercept, accuracy=float("nan"), blur=BLUR_SIGMA,
-                 normalise=NORMALISE, level_width=True):
-        self.coef = np.asarray(coef, dtype=np.float32)
-        self.intercept = float(intercept)
-        self.accuracy = float(accuracy)
-        self.blur = float(blur)
-        self.normalise = normalise
-        self.level_width = bool(level_width)
+    Shared by every model kind, because where a crop comes from is a property of
+    the dataset convention and not of the thing classifying it. A model that cut
+    its own crops differently would be comparing itself against a different
+    dataset while appearing to share one.
 
-    @classmethod
-    def load(cls, path=DEFAULT_PATH):
-        d = np.load(path)
-        # Generations predating the blur were fitted on sharp features; defaulting
-        # to 0.0 keeps them meaning what they meant when they were trained.
-        blur = float(d["blur"]) if "blur" in d.files else 0.0
-        # Generations predating normalisation were fitted on absolute pixel
-        # values; "none" keeps them meaning what they meant when trained.
-        norm = str(d["normalise"]) if "normalise" in d.files else "none"
-        # Generations predating the levelled width were fitted on crops whose
-        # scale came from an axis-aligned box, so they must keep being fed those.
-        level_width = bool(d["level_width"]) if "level_width" in d.files else False
-        return cls(d["coef"], d["intercept"],
-                   d.get("cv_accuracy", float("nan")), blur, norm, level_width)
+    Subclasses supply ``predict`` and ``p_closed``.
+    """
 
-    @classmethod
-    def exists(cls, path=DEFAULT_PATH):
-        return os.path.exists(path)
-
-    def save(self, path=DEFAULT_PATH):
-        np.savez(path, coef=self.coef, intercept=self.intercept,
-                 in_h=data.IN_H, in_w=data.IN_W, blur=self.blur,
-                 normalise=self.normalise, pad_w=data.PAD_W, pad_h=data.PAD_H,
-                 level_width=self.level_width, cv_accuracy=self.accuracy)
-
-    def p_closed(self, crops):
-        crops = [c for c in crops if c is not None]
-        if not crops:
-            return np.array([])
-        return 1.0 / (1.0 + np.exp(
-            -(features(crops, self.blur, self.normalise) @ self.coef
-              + self.intercept)))
-
-    def predict(self, crops):
-        """P(open) per crop, preserving None entries."""
-        out, usable = [], [c for c in crops if c is not None]
-        probs = iter(1.0 - self.p_closed(usable)) if usable else iter(())
-        for c in crops:
-            out.append(float(next(probs)) if c is not None else None)
-        return out
+    level_width = True
+    blur = None          # not every model has one; the live view checks for None
 
     def eyes(self, gray, lm, roll=None):
         """P(open) and the sampled quad for both eyes, from mesh landmarks.
@@ -262,4 +223,67 @@ class EyeModel:
             crops.append(crop)
             quads.append(quad)
         probs = self.predict(crops)
-        return dict(zip(sides, probs)), dict(zip(sides, crops)), dict(zip(sides, quads))
+        return dict(zip(sides, probs)), dict(zip(sides, crops)), \
+            dict(zip(sides, quads))
+
+
+class EyeModel(CropSource):
+    """Loaded classifier. ``predict`` returns P(open) per crop."""
+
+    kind = "pixel"
+
+    def __init__(self, coef, intercept, accuracy=float("nan"), blur=BLUR_SIGMA,
+                 normalise=NORMALISE, level_width=True):
+        self.coef = np.asarray(coef, dtype=np.float32)
+        self.intercept = float(intercept)
+        self.accuracy = float(accuracy)
+        self.blur = float(blur)
+        self.normalise = normalise
+        self.level_width = bool(level_width)
+
+    @classmethod
+    def load(cls, path=DEFAULT_PATH):
+        d = np.load(path)
+        # Generations predating the blur were fitted on sharp features; defaulting
+        # to 0.0 keeps them meaning what they meant when they were trained.
+        blur = float(d["blur"]) if "blur" in d.files else 0.0
+        # Generations predating normalisation were fitted on absolute pixel
+        # values; "none" keeps them meaning what they meant when trained.
+        norm = str(d["normalise"]) if "normalise" in d.files else "none"
+        # Generations predating the levelled width were fitted on crops whose
+        # scale came from an axis-aligned box, so they must keep being fed those.
+        level_width = bool(d["level_width"]) if "level_width" in d.files else False
+        return cls(d["coef"], d["intercept"],
+                   d.get("cv_accuracy", float("nan")), blur, norm, level_width)
+
+    @classmethod
+    def exists(cls, path=DEFAULT_PATH):
+        return os.path.exists(path)
+
+    def describe(self):
+        """One line for the live view header."""
+        return f"pixel  blur {self.blur}  norm {self.normalise}"
+
+    def save(self, path=DEFAULT_PATH):
+        np.savez(path, coef=self.coef, intercept=self.intercept,
+                 in_h=data.IN_H, in_w=data.IN_W, blur=self.blur,
+                 normalise=self.normalise, pad_w=data.PAD_W, pad_h=data.PAD_H,
+                 level_width=self.level_width, cv_accuracy=self.accuracy,
+                 kind=self.kind)
+
+    def p_closed(self, crops):
+        crops = [c for c in crops if c is not None]
+        if not crops:
+            return np.array([])
+        return 1.0 / (1.0 + np.exp(
+            -(features(crops, self.blur, self.normalise) @ self.coef
+              + self.intercept)))
+
+    def predict(self, crops):
+        """P(open) per crop, preserving None entries."""
+        out, usable = [], [c for c in crops if c is not None]
+        probs = iter(1.0 - self.p_closed(usable)) if usable else iter(())
+        for c in crops:
+            out.append(float(next(probs)) if c is not None else None)
+        return out
+

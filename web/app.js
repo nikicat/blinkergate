@@ -201,7 +201,7 @@ async function loadModels() {
   const body = $("#models tbody");
   if (!data.generations.length) {
     body.replaceChildren(Object.assign(document.createElement("tr"), {
-      innerHTML: '<td colspan="7" class="muted">No generations yet — label some ' +
+      innerHTML: '<td colspan="8" class="muted">No generations yet — label some ' +
                  "samples and press Train.</td>",
     }));
     return;
@@ -214,6 +214,8 @@ async function loadModels() {
     const cells = [
       m.active ? "●" : "",
       m.id,
+      // Generations predating the pooled model carry no kind and are pixel ones.
+      m.kind || "pixel",
       (m.created_at || "").replace("T", " ").replace("+00:00", ""),
       pct(m.accuracy),
       // Not scored rather than scored wrongly: a generation fitted on an older
@@ -279,12 +281,18 @@ $("#copy-ids").onclick = () => {
 
 $("#train").onclick = async (event) => {
   const button = event.target;
+  const kind = $("#kind").value;
   button.disabled = true;
   button.textContent = "Training…";
   try {
-    const res = await api("/api/models", { method: "POST" });
+    const res = await api("/api/models", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ kind }),
+    });
     const acc = res.accuracy === null ? "n/a" : `${(res.accuracy * 100).toFixed(1)}%`;
-    toast(`${res.generation}: ${acc} held-out on ${res.n_train} samples`, 5000);
+    toast(`${res.generation} (${res.kind}): ${acc} held-out on ${res.n_train} samples`,
+          5000);
     await loadSamples();
   } catch (err) {
     toast(err.message, 5000);

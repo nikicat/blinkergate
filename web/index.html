@@ -58,6 +58,10 @@
     <button class="label-btn closed" data-label="closed">Closed <kbd>c</kbd></button>
     <button class="label-btn skip" data-label="skip">Skip <kbd>s</kbd></button>
     <span class="sep"></span>
+    <select id="kind" title="pixel reads fixed pixels; pooled convolves learned kernels and takes the maximum, so it tolerates a shifted pupil">
+      <option value="pixel">pixel</option>
+      <option value="pooled">pooled</option>
+    </select>
     <button id="train" class="primary">Train new generation</button>
   </div>
   <p class="hint">
@@ -81,7 +85,7 @@
   </p>
   <table id="models">
     <thead><tr>
-      <th></th><th>generation</th><th>created</th><th>held-out</th>
+      <th></th><th>generation</th><th>kind</th><th>created</th><th>held-out</th>
       <th>on newer labels</th><th>trained on</th><th>labels at the time</th>
     </tr></thead>
     <tbody></tbody>

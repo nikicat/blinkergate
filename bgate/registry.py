@@ -86,21 +86,19 @@ class Registry:
     def list(self):
         return [m for m in (self.meta(g) for g in self.ids()) if m]
 
-    def create(self, coef, intercept, accuracy, samples, all_rows, blur=None,
-               normalise=None):
-        """Write a new generation. ``samples`` are the ones that trained it;
-        ``all_rows`` is the whole label file, skips included, so the snapshot
-        records what was excluded as well as what was used."""
+    def create(self, model_obj, accuracy, samples, all_rows):
+        """Write a new generation from a fitted model.
+
+        Takes the model rather than its weights, so a generation can hold any
+        kind - the pixel template or a pooled one - without this having to know
+        the difference. ``samples`` are the ones that trained it; ``all_rows`` is
+        the whole label file, skips included, so the snapshot records what was
+        excluded as well as what was used.
+        """
         gen = self.next_id()
         os.makedirs(self.path(gen), exist_ok=True)
-
-        from .model import BLUR_SIGMA, NORMALISE
-        blur = BLUR_SIGMA if blur is None else blur
-        normalise = NORMALISE if normalise is None else normalise
-        np.savez(self.path(gen, "model.npz"), coef=coef, intercept=intercept,
-                 in_h=data.IN_H, in_w=data.IN_W, blur=blur, normalise=normalise,
-                 pad_w=data.PAD_W, pad_h=data.PAD_H, level_width=True,
-                 cv_accuracy=accuracy)
+        model_obj.accuracy = accuracy
+        model_obj.save(self.path(gen, "model.npz"))
 
         with open(self.path(gen, "dataset.csv"), "w", newline="") as fh:
             w = csv.DictWriter(fh, fieldnames=data.FIELDS)
@@ -111,13 +109,15 @@ class Registry:
                   for label in data.LABELS}
         meta = {
             "created_at": datetime.now(timezone.utc).isoformat(timespec="seconds"),
+            "kind": model_obj.kind,
             "accuracy": None if accuracy != accuracy else round(float(accuracy), 4),
             "n_train": len(samples),
             "n_bursts": len({s["burst"] for s in samples}),
             "counts": counts,
             "crop": {"pad_w": data.PAD_W, "pad_h": data.PAD_H,
-                     "in_h": data.IN_H, "in_w": data.IN_W, "blur": blur,
-                     "normalise": normalise, "roll_levelled": True,
+                     "in_h": data.IN_H, "in_w": data.IN_W,
+                     "blur": model_obj.blur,
+                     "normalise": model_obj.normalise, "roll_levelled": True,
                      "convention": data.CROP_CONVENTION},
             "crops_sha256": crops_hash(samples),
             "versions": _versions(),
@@ -175,9 +175,77 @@ class Registry:
             return 0.0
 
     def load(self, gen):
-        from .model import EyeModel
-        return EyeModel.load(self.path(gen, "model.npz"))
+        return load_model(self.path(gen, "model.npz"))
 
     def load_active(self):
         gen = self.active()
         return (gen, self.load(gen)) if gen else (None, None)
+
+
+def load_model(path):
+    """A generation's model, whichever kind it is.
+
+    The dispatch lives here rather than in ``model`` so that module need not know
+    about ``pooled``, which imports it. Generations written before there was more
+    than one kind carry no ``kind`` and are the pixel template.
+    """
+    from .model import EyeModel
+    from .pooled import PooledModel
+
+    kind = "pixel"
+    try:
+        with np.load(path) as d:
+            if "kind" in d.files:
+                kind = str(d["kind"])
+    except Exception:
+        pass
+    return PooledModel.load(path) if kind == "pooled" else EyeModel.load(path)
+
+
+KINDS = ("pixel", "pooled")
+
+
+def fit_model(kind, samples, cv=True):
+    """Fit a model of the given kind. Returns ``(model, held_out_accuracy)``.
+
+    The one place a kind name turns into a fitted model, so the live view, the
+    web UI and the evaluation scripts cannot end up comparing something other
+    than what ships.
+
+    ``cv`` controls whether held-out accuracy is computed. Callers doing their
+    own outer cross-validation should pass False - and note that the pixel fit
+    decides this by counting bursts, so an evaluation harness that stamps every
+    row with one dummy burst gets the same saving for free.
+    """
+    if kind not in KINDS:
+        raise ValueError(f"unknown model kind {kind!r}, expected one of {KINDS}")
+    if kind == "pooled":
+        from .pooled import PooledModel, fit as pooled_fit
+        kernels, coef, intercept, accuracy = pooled_fit(samples, cv=cv)
+        return PooledModel(kernels, coef, intercept, accuracy), accuracy
+    from . import model as pixel_model
+    coef, intercept, accuracy = pixel_model.fit(samples)
+    return pixel_model.EyeModel(coef, intercept, accuracy), accuracy
+
+
+def train_and_register(dataset, registry, kind="pixel", activate=True):
+    """Fit a generation from the current labels and write it.
+
+    One implementation for both surfaces. The live view and the web UI were
+    running separate copies of this, which is how they came to disagree about
+    which crops trained a model in the first place.
+
+    Returns ``(generation, accuracy, n_train)``.
+    """
+    dataset.reload_if_changed()
+    dataset.refresh_crops()
+    samples = dataset.trainable()
+    counts = dataset.counts()
+    if min(counts[data.OPEN], counts[data.CLOSED]) < 10:
+        raise ValueError(f"need at least 10 of each label: {counts}")
+
+    fitted, accuracy = fit_model(kind, samples)
+    gen = registry.create(fitted, accuracy, samples, dataset.rows)
+    if activate:
+        registry.set_active(gen)
+    return gen, accuracy, len(samples)

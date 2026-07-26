@@ -126,56 +126,141 @@ def report_error(labels_, angles, err):
           " levelling by the measured roll.")
 
 
-def report_accuracy(labels_, angles, crops, keys, labels):
+def _rows(crops, keys, labels, idx):
+    """Sample dicts in the shape the fitters want.
+
+    Every row gets the same burst on purpose: the outer fold has already held
+    bursts out, so an inner cross-validation would be five extra fits for a
+    number nobody reads.
+    """
+    return [{"crop": crops[i],
+             "label": labels[keys[i]],
+             "burst": "one", "frame": "one"} for i in idx]
+
+
+def _score_job(kind, train_crops, train_keys, train_idx, per_angle, labels,
+               angles):
+    """One (variant, kind, fold): fit on upright crops, score at every angle."""
+    from bgate.registry import fit_model
+
+    fitted, _acc = fit_model(kind, _rows(train_crops, train_keys, labels,
+                                         train_idx), cv=False)
+    hits = {}
+    for a in angles:
+        crops_a, keys_a, idx_a = per_angle[a]
+        if not idx_a:
+            hits[a] = (0, 0)
+            continue
+        p = fitted.p_closed([crops_a[i] for i in idx_a])
+        truth = np.array([labels[keys_a[i]] == data.CLOSED for i in idx_a])
+        hits[a] = (int(((p > 0.5) == truth).sum()), len(idx_a))
+    return hits
+
+
+def report_accuracy(labels_, angles, crops, keys, labels, kinds, n_jobs=-1):
     """Verdicts per variant per angle, whole capture bursts held out.
 
     Each variant is fitted on its own upright crops, because a model fitted on one
     crop convention says nothing about another - which is the same reason blur and
-    normalisation travel inside a generation.
+    normalisation travel inside a generation. Every (variant, kind, fold) is
+    independent, so they all run at once.
     """
+    from joblib import Parallel, delayed
     from sklearn.model_selection import GroupKFold
-
-    from bgate.model import _make_clf
 
     def usable(vname, a):
         """Positions with a trainable label. Both eyes of a frame get cropped,
         but one of them may be skipped, and a skip has no true class to score."""
         return [i for i, k in enumerate(keys[(vname, a)]) if k in labels]
 
-    print(f"\n  {'variant':<16}" + "".join(f"{a:>8}" for a in angles))
+    jobs, owner = [], []
     for vname in labels_:
         base = usable(vname, 0)
         if not base:
             continue
         base_keys = [keys[(vname, 0)][i] for i in base]
-        X = features([crops[(vname, 0)][i] for i in base])
         y = np.array([labels[k] == data.CLOSED for k in base_keys], dtype=int)
         groups = np.array([data.burst_of(f) for f, _s in base_keys])
         if len(set(y)) < 2 or len(set(groups)) < 2:
             continue
+        splits = list(GroupKFold(n_splits=min(5, len(set(groups)))).split(
+            base, y, groups))
+        for kind in kinds:
+            for train, test in splits:
+                held = set(groups[test])
+                per_angle = {}
+                for a in angles:
+                    sel = [i for i in usable(vname, a)
+                           if data.burst_of(keys[(vname, a)][i][0]) in held]
+                    per_angle[a] = (crops[(vname, a)], keys[(vname, a)], sel)
+                jobs.append(delayed(_score_job)(
+                    kind, crops[(vname, 0)], keys[(vname, 0)],
+                    [base[i] for i in train], per_angle, labels, angles))
+                owner.append((vname, kind))
 
-        hits = {a: [0, 0] for a in angles}
-        for train, test in GroupKFold(n_splits=min(5, len(set(groups)))).split(
-                X, y, groups):
-            clf = _make_clf()
-            clf.fit(X[train], y[train])
-            held = set(groups[test])
-            for a in angles:
-                sel = [i for i in usable(vname, a)
-                       if data.burst_of(keys[(vname, a)][i][0]) in held]
-                if not sel:
-                    continue
-                Xa = features([crops[(vname, a)][i] for i in sel])
-                ya = np.array([labels[keys[(vname, a)][i]] == data.CLOSED
-                               for i in sel], dtype=int)
-                hits[a][0] += int((clf.predict(Xa) == ya).sum())
-                hits[a][1] += len(sel)
-        line = f"  {vname:<16}"
+    results = Parallel(n_jobs=n_jobs)(jobs)
+    totals = {}
+    for key, hits in zip(owner, results):
+        acc = totals.setdefault(key, {a: [0, 0] for a in angles})
         for a in angles:
-            hit, tot = hits[a]
-            line += f"{hit / tot:>8.1%}" if tot else f"{'-':>8}"
-        print(line)
-    print("\n  bursts held out; each variant fitted on its own upright crops.")
+            acc[a][0] += hits[a][0]
+            acc[a][1] += hits[a][1]
+
+    print(f"\n  {'variant':<16}{'model':<9}" + "".join(f"{a:>8}" for a in angles))
+    for vname in labels_:
+        for kind in kinds:
+            if (vname, kind) not in totals:
+                continue
+            line = f"  {vname:<16}{kind:<9}"
+            for a in angles:
+                hit, tot = totals[(vname, kind)][a]
+                line += f"{hit / tot:>8.1%}" if tot else f"{'-':>8}"
+            print(line)
+    print("\n  bursts held out; each row fitted on its own upright crops.")
+
+
+CACHE = ".rollsweep.npz"
+
+
+def cached_sweep(frames, ds_dir, locators, variants, angles, refresh=False):
+    """``sweep`` with its result kept on disk.
+
+    The detection pass is minutes of MediaPipe - every frame at every angle
+    through every locator - and it does not change between runs unless the crop
+    convention or the frame set does, both of which are in the key.
+    """
+    path = os.path.join(ds_dir, CACHE)
+    key = (f"{data.CROP_CONVENTION}|{len(frames)}|{frames[0]}|{frames[-1]}|"
+           f"{','.join(str(a) for a in angles)}|"
+           f"{','.join(v[0] for v in variants)}")
+    if not refresh and os.path.exists(path):
+        try:
+            z = np.load(path, allow_pickle=False)
+            if str(z["key"]) == key:
+                err, crops, keys = {}, {}, {}
+                for vname, _l, _w in variants:
+                    for a in angles:
+                        tag = f"{vname}|{a}"
+                        err[(vname, a)] = z[f"err|{tag}"]
+                        crops[(vname, a)] = list(z[f"crops|{tag}"])
+                        keys[(vname, a)] = [tuple(r) for r in z[f"keys|{tag}"]]
+                print(f"reusing the cached detection pass ({path})")
+                return int(z["n_base"]), err, crops, keys
+        except Exception:
+            pass
+
+    n_base, err, crops, keys = sweep(frames, ds_dir, locators, variants, angles)
+    out = {"key": key, "n_base": n_base}
+    for vname, _l, _w in variants:
+        for a in angles:
+            tag = f"{vname}|{a}"
+            out[f"err|{tag}"] = np.array(err[(vname, a)], dtype=np.float32)
+            out[f"crops|{tag}"] = (np.stack(crops[(vname, a)])
+                                   if crops[(vname, a)]
+                                   else np.zeros((0, data.IN_H, data.IN_W), np.uint8))
+            out[f"keys|{tag}"] = np.array(keys[(vname, a)] or [["", ""]], dtype="<U64")
+    np.savez(path, **out)
+    return n_base, err, crops, keys
 
 
 def main():
@@ -187,6 +272,11 @@ def main():
                     help="sample this many frames (0 = all)")
     ap.add_argument("--score", action="store_true",
                     help="also score verdicts - slower, and the number that counts")
+    ap.add_argument("--kinds", default="pixel,pooled",
+                    help="model kinds to score")
+    ap.add_argument("--jobs", type=int, default=-1)
+    ap.add_argument("--refresh", action="store_true",
+                    help="ignore the cached detection pass")
     args = ap.parse_args()
 
     angles = [int(a) for a in args.angles.split(",")]
@@ -208,17 +298,18 @@ def main():
 
     print(f"{len(frames)} labelled frames, {len(angles)} angles, "
           f"{len(VARIANTS)} variants")
-    n_base, err, crops, keys = sweep(frames, args.dataset, locators, VARIANTS,
-                                     angles)
+    n_base, err, crops, keys = cached_sweep(frames, args.dataset, locators,
+                                            VARIANTS, angles, args.refresh)
     print(f"\n{n_base} frames had a baseline fit to compare against")
-
-    refit = locators["refit"]
-    print(f"the refit ran on {refit.refits} fits and was rejected on "
-          f"{refit.rejected} as having moved too far")
+    if locators["refit"].refits:
+        refit = locators["refit"]
+        print(f"the refit ran on {refit.refits} fits and was rejected on "
+              f"{refit.rejected} as having moved too far")
 
     report_error(names, angles, err)
     if args.score:
-        report_accuracy(names, angles, crops, keys, labels)
+        report_accuracy(names, angles, crops, keys, labels,
+                        [k for k in args.kinds.split(",") if k], args.jobs)
     else:
         print("\n  --score adds what this costs in verdicts, which is the number"
               " that decides.")

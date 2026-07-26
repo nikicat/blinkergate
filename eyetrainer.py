@@ -11,17 +11,25 @@ and this picks it up within a second, without a restart.
   o  both open          c  both closed
   1  YOUR LEFT shut     2  YOUR RIGHT shut       (one frame per press)
   h  save this frame as a detector test case (press when it says NO FACE)
-  t  train a new generation from the current dataset
+  t  train a new PIXEL generation from the current dataset
+  p  train a new POOLED generation (learned kernels, shift-invariant)
   g  cycle generation: follow-the-web-UI, then each one in turn
-  b  override the blur (diagnostic - see below)
+  b  override the blur (diagnostic, pixel models only - see below)
   q  quit               + -  resize              f  fullscreen
 
-Blur is a property of a model, not a switch: one fitted on blurred features is
-meaningless applied to sharp ones. So the honest blur A/B is `g`, cycling between
-generations that were *trained* differently - the header shows each one's blur.
-`b` forces a different blur onto the current model and is labelled MISMATCH when
-it disagrees with what that model was trained with; it is there to show what the
-mismatch looks like, not to be run in.
+Two kinds of model, and `g` is how you compare them. The pixel one reads 960 fixed
+pixels, so the pupil has to be where it was during training; the pooled one
+convolves learned kernels and takes the maximum, so it does not care where the
+pupil is. Measured on deliberate crop shifts, 96.3% -> 44.2% at 4px for the pixel
+model against 99.5% -> 98.3% for the pooled one. The header names which kind is
+loaded.
+
+Blur is a property of a pixel model, not a switch: one fitted on blurred features
+is meaningless applied to sharp ones. So the honest blur A/B is `g`, cycling
+between generations that were *trained* differently - the header shows each one's
+blur. `b` forces a different blur onto the current model and is labelled MISMATCH
+when it disagrees with what that model was trained with; it is there to show what
+the mismatch looks like, not to be run in. A pooled model has no blur.
 
 Sides are YOURS. The feed is not mirrored, so your left eye appears on the RIGHT
 of the picture - the insets are laid out to match the picture, so the one on the
@@ -41,8 +49,7 @@ from bgate import data, ui
 from bgate.camera import IRCamera, DEFAULT_DEVICE
 from bgate.data import Dataset
 from bgate.detect import default_locator
-from bgate.model import fit
-from bgate.registry import Registry
+from bgate.registry import Registry, train_and_register
 
 WIN = "blinkergate"
 POLL_EVERY = 1.0              # seconds between checks for a generation switch
@@ -90,8 +97,12 @@ class App:
                        else "no model - capture samples, then press t")
 
     def apply_blur(self):
-        """Push the override, if any, onto the loaded model."""
-        if self.model is None:
+        """Push the override, if any, onto the loaded model.
+
+        A pooled model has no blur - it convolves learned kernels instead - so
+        there is nothing to override and nothing to restore.
+        """
+        if self.model is None or self.model.blur is None:
             return
         if self.trained_blur is None:
             self.trained_blur = self.model.blur
@@ -117,11 +128,14 @@ class App:
         if chosen is None:
             print(f"  following the web UI -> {self.model_gen}")
         else:
-            print(f"  pinned {chosen}  blur={self.model.blur}"
+            print(f"  pinned {chosen}  {self.model.describe()}"
                   f"  ({self.model.accuracy:.1%})")
 
     def cycle_blur(self):
         """Force a blur onto the current model. Diagnostic only."""
+        if self.model is None or self.model.blur is None:
+            print("  this model has no blur to override")
+            return
         options = [None, 0.0, 0.8, 1.6, 2.4]
         i = options.index(self.blur_override) if self.blur_override in options else 0
         self.blur_override = options[(i + 1) % len(options)]
@@ -188,50 +202,46 @@ class App:
         self.status = f"detector case {self.hard} saved ({found}): {frame}"
         print(f"  {self.status}")
 
-    def train(self):
-        # The web UI may have relabelled since we loaded; train on what is there.
-        if self.dataset.reload_if_changed():
-            print("  picked up label changes from the web UI")
-        self.dataset.refresh_crops()
-        samples = self.dataset.trainable()
-        counts = self.dataset.counts()
-        if min(counts[data.OPEN], counts[data.CLOSED]) < 10:
-            self.status = f"need 10+ of each: {counts[data.OPEN]}/{counts[data.CLOSED]}"
-            return
+    def train(self, kind="pixel"):
+        # Shared with the web UI, so the two cannot drift on what trains a model.
         try:
-            coef, intercept, accuracy = fit(samples)
+            gen, accuracy, n = train_and_register(self.dataset, self.registry, kind)
         except Exception as exc:
             self.status = f"training failed: {exc}"
+            print(f"  {self.status}")
             return
-        gen = self.registry.create(coef, intercept, accuracy, samples,
-                                   self.dataset.rows)
-        self.registry.set_active(gen)
         self.trained_blur = None
         self.blur_override = None
         self.load_model()
-        self.status = f"{gen}: {len(samples)} samples, held-out {accuracy:.1%}"
+        self.status = f"{gen} ({kind}): {n} samples, held-out {accuracy:.1%}"
         print(f"  {self.status}")
+
+    def blur_mismatch(self):
+        """Is the loaded model being fed features it was not fitted on?
+
+        Only a pixel model can be: a pooled one has no blur, so a leftover
+        override from the generation before it is not a mismatch. Reporting one
+        anyway painted the header red on a model that was working perfectly.
+        """
+        return (self.model is not None and self.model.blur is not None
+                and self.blur_override is not None
+                and self.blur_override != self.trained_blur)
 
     def model_line(self):
         if self.model is None:
             return self.status
-        mismatch = (self.blur_override is not None
-                    and self.blur_override != self.trained_blur)
-        text = (f"{self.model_gen}  blur {self.model.blur}"
-                f"  norm {self.model.normalise}"
+        text = (f"{self.model_gen}  {self.model.describe()}"
                 f"  ({self.model.accuracy:.1%} held-out)")
         text += "  [pinned]" if self.pinned else "  [following web UI]"
         if len(self.gens) > 1:
             text += f"  ({len(self.gens)} generations)"
-        if mismatch:
+        if self.blur_mismatch():
             text += f"  MISMATCH: trained with {self.trained_blur}"
         return text
 
     def model_colour(self):
-        if (self.blur_override is not None
-                and self.blur_override != self.trained_blur):
-            return (0, 0, 255)      # a mismatched blur is not a valid reading
-        return (0, 200, 255)
+        # A mismatched blur is not a valid reading, so say so in red.
+        return (0, 0, 255) if self.blur_mismatch() else (0, 200, 255)
 
     def render(self, gray, det):
         raw = cv2.cvtColor(ui.enlarge(gray), cv2.COLOR_GRAY2BGR)
@@ -280,8 +290,8 @@ class App:
              + (f"  via {self.locator_used}" if self.locator_used else ""),
              0.45, (200, 200, 120)),
             (self.model_line(), 0.42, self.model_colour()),
-            ("o/c/1/2 capture   h hard case   t train   g gen   q quit",
-             0.38, (150, 150, 150)),
+            ("o/c/1/2 capture   h hard case   t train pixel   p train pooled   "
+             "g gen   q quit", 0.38, (150, 150, 150)),
         ])
         return np.vstack([top, band])
 
@@ -344,7 +354,10 @@ def main():
             break
         elif key == ord("t"):
             app.status = "training ..."
-            app.train()
+            app.train("pixel")
+        elif key == ord("p"):
+            app.status = "training pooled ..."
+            app.train("pooled")
         elif key == ord("g"):
             app.cycle_generation()
         elif key == ord("b"):

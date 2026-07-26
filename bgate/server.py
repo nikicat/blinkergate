@@ -19,8 +19,7 @@ from pydantic import BaseModel
 
 from . import data
 from .data import Dataset
-from .model import fit
-from .registry import Registry
+from .registry import KINDS, Registry, train_and_register
 
 WEB_DIR = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "web")
 
@@ -28,6 +27,10 @@ WEB_DIR = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__)
 class LabelRequest(BaseModel):
     ids: list[str]
     label: str
+
+
+class TrainRequest(BaseModel):
+    kind: str = "pixel"
 
 
 class State:
@@ -77,6 +80,7 @@ def create_app(ds_dir="dataset", models_dir="models"):
         preds = state.predictions(rows)
         return {
             "active_generation": state.model_gen,
+            "kinds": list(KINDS),
             "counts": state.dataset.counts(),
             "samples": [
                 {
@@ -135,19 +139,19 @@ def create_app(ds_dir="dataset", models_dir="models"):
         return {"generations": out, "active": state.registry.active()}
 
     @app.post("/api/models")
-    def train():
-        state.dataset.reload_if_changed()
-        samples = state.dataset.trainable()
-        counts = state.dataset.counts()
-        if min(counts[data.OPEN], counts[data.CLOSED]) < 10:
-            raise HTTPException(400, f"need at least 10 of each label: {counts}")
-        coef, intercept, accuracy = fit(samples)
-        gen = state.registry.create(coef, intercept, accuracy, samples,
-                                    state.dataset.rows)
-        state.registry.set_active(gen)
+    def train(req: TrainRequest | None = None):
+        kind = (req.kind if req else None) or "pixel"
+        try:
+            # Shared with the live view, so the two surfaces cannot disagree
+            # about what trains a model.
+            gen, accuracy, n = train_and_register(state.dataset, state.registry,
+                                                  kind)
+        except ValueError as exc:
+            raise HTTPException(400, str(exc))
         state.reload_model()
-        return {"generation": gen, "accuracy": None if accuracy != accuracy else accuracy,
-                "n_train": len(samples)}
+        return {"generation": gen, "kind": kind,
+                "accuracy": None if accuracy != accuracy else accuracy,
+                "n_train": n}
 
     @app.post("/api/models/{gen}/activate")
     def activate(gen: str):

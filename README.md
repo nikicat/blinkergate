@@ -27,6 +27,7 @@ were measured at:
 | OCEC + CLAHE / equalize / contrast-stretch | 50% (chance) | 0% |
 | OCEC + crop padding swept 1.0→3.0 | no improvement | — |
 | **linear model fitted on this camera** | **97.7%** | **~98%** |
+| **pooled kernels fitted on this camera** | **99.8%** | **~99%** |
 
 The published models are trained on well-exposed close-up IR eyes. A laptop Hello
 camera gives an ~18-pixel-wide, low-contrast, frequently oblique eye instead —
@@ -98,7 +99,22 @@ relabelling brings it straight back, which is why there is no undo to get wrong.
 ### Train
 
 Press **Train new generation** (or `t` in the camera window). Training never
-overwrites: it appends. Each generation keeps
+overwrites: it appends.
+
+Two kinds of model, chosen by the dropdown beside the button (`t` and `p` in the
+camera window):
+
+- **pixel** — logistic regression on the 960 raw pixels. A template matcher: the
+  pupil has to be roughly where it was during training.
+- **pooled** — learned convolution kernels, max-pooled over position, then the
+  same logistic layer. The maximum does not move when the pupil does, so a
+  shifted or off-gaze pupil costs nothing. Smaller too: 621 weights against 961.
+
+The difference is the whole point, and `g` in the camera window cycles between
+generations so you can watch it. Measured on deliberate crop shifts, 96.3% → 44.2%
+at 4 px for the pixel model against 99.5% → 98.3% for the pooled one.
+
+Each generation keeps
 
 - `model.npz` — the weights
 - `dataset.csv` — every label at the moment it was trained
@@ -123,13 +139,19 @@ tell whether a newer one is genuinely better or the labels moved underneath it.
 eyetrainer.py     live view: detection + labelled capture
 serve.py          labelling web UI
 bgate/camera.py   IR capture, drops unlit strobe frames
-bgate/data.py     the dataset: samples, labels, crop cache
-bgate/registry.py model generations and their snapshots
-bgate/model.py    fit / load / predict
+bgate/data.py     the dataset: samples, labels, crop cache, crop geometry
+bgate/detect.py   locating the eyes, from more than one detector
+bgate/registry.py model generations, their snapshots, and fitting
+bgate/model.py    the pixel model: fit / load / predict
+bgate/pooled.py   the pooled model: learned kernels, max-pooled
 bgate/server.py   FastAPI app
 bgate/ui.py       drawing
 bgate/qtfix.py    Qt platform fallback, imported before cv2
 web/              the labelling UI, vanilla JS, no build step
+
+eval_detectors.py score detectors on frames where detection failed
+roll_sweep.py     what head roll costs, against exactly known ground truth
+pooled_eval.py    pooled against pixel, and whether it is really shift-invariant
 ```
 
 `dataset/` and `models/` are gitignored — pictures of your face and models of
@@ -159,23 +181,35 @@ yourself a working detector is broken.
 Detection finds 100% of the frames captured because it was struggling, and
 enrolment works.
 
-That 100% is a detection *rate*, and it turned out to be hiding the next problem:
-finding a face and locating the eyes inside it are different jobs, and a rate can
-only see the first. On a rolled head the mesh keeps finding the face and puts the
-eyes in the wrong place — enough to cost 24 points of accuracy at 35° of tilt.
-`roll_sweep.py` measures it, by rotating a labelled frame so the true eye position
-is known exactly:
+That 100% is a detection *rate*, and it was hiding the next problem: finding a
+face and locating the eyes inside it are different jobs, and a rate can only see
+the first. On a rolled head the mesh keeps finding the face and puts the eyes in
+the wrong place. Levelling the fit and measuring eye width along the levelled axis
+recovered most of it.
 
-| roll | before | after |
-|---|---|---|
-| −35° | 60.9% | **84.4%** |
-| 0° | 94.2% | **95.4%** |
-| +35° | 69.7% | **86.7%** |
+But the deeper problem was the classifier. A linear model on raw pixels can encode
+"bright *here*", never "bright *anywhere near here*" — and the pupil is genuinely
+somewhere else a lot of the time, because gaze moves it. Measured directly, the
+bright disc sits a median 1.8 px from the crop centre and up to 9.9 px away, and
+re-centring the crop does not help: the offset is scatter, not bias.
+
+Replacing the template with **learned convolution kernels and a maximum over
+position** fixes what no amount of better detection can, and the two stack:
+
+| roll | pixel, as found | pixel, geometry fixed | **pooled** |
+|---|---|---|---|
+| −35° | 62.4% | 86.1% | **92.1%** |
+| 0° | 95.1% | 96.0% | **99.8%** |
+| +35° | 74.2% | 88.6% | **93.8%** |
+
+`roll_sweep.py --score` produces that, by rotating a labelled frame so the true
+eye position is known exactly. `pooled_eval.py` does the same for crop shifts.
 
 Not yet measured: the **false-positive rate during ordinary blinking**, which is
 what decides whether this can gate privilege escalation, and which posed captures
 cannot produce — it needs a passive recording while the camera is ignored. Every
-accuracy figure here is conditioned on a deliberate pose.
+accuracy figure here is conditioned on a deliberate pose, one subject and one
+camera.
 
 Ambient infrared is the outer limit rather than anything in the software: above
 roughly the level where frame contrast falls to a quarter of normal, the
