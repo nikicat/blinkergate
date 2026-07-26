@@ -223,7 +223,7 @@ def _frame_lane(panel, top, bot, x0, x1, xof, pts, captures=None):
 
 
 def timeline(width, history, now, thresh, window, lanes, frame_time=True,
-             captures=None):
+             captures=None, cursor=None):
     """Time-synced lanes of P(open), most recent at the right edge.
 
     ``history`` is an iterable of ``(t, p0, p1)`` with ``None`` for a frame where
@@ -247,6 +247,9 @@ def timeline(width, history, now, thresh, window, lanes, frame_time=True,
 
     ``frame_time`` adds a third lane of the interval between frames, sharing the
     same x mapping so a stall lines up with whatever the eyes were doing during it.
+
+    ``cursor`` is a stamp to mark with a vertical line - the frame selected while
+    paused.
     """
     lane_h = int(LANE_H * S)
     head_h = int(TIMELINE_HEAD * S)
@@ -350,6 +353,11 @@ def timeline(width, history, now, thresh, window, lanes, frame_time=True,
             # and its label ran off it.
             lx = min(x + int(2 * S), width - text_width(label, 0.32) - int(3 * S))
             txt(panel, label, (lx, int(12 * S)), 0.32, (120, 120, 128))
+
+    if cursor is not None:
+        x = xof(cursor)
+        cv2.line(panel, (x, 0), (x, panel.shape[0]), (0, 220, 255),
+                 max(1, int(S)))
     return panel
 
 

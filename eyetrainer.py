@@ -16,6 +16,10 @@ and this picks it up within a second, without a restart.
   g  cycle generation: follow-the-web-UI, then each one in turn
   b  override the blur (diagnostic, pixel models only - see below)
   q  quit               + -  resize              f  fullscreen
+  SPACE  pause; click the timeline (or step with , .) to revisit any frame of
+         the last 10 seconds - the capture keys then save THAT frame. For
+         grabbing a misdetection after you saw it: a blink is ~one frame, gone
+         before you can press anything live.
 
 Two kinds of model, and `g` is how you compare them. The pixel one reads 960 fixed
 pixels, so the pupil has to be where it was during training; the pooled one
@@ -101,6 +105,10 @@ class Verdict:
         self.probs, self.quads = probs, quads
         self.locator, self.angle = locator, angle
 
+    def __getitem__(self, i):
+        # A Verdict is its own timeline entry: the strip reads (t, p0, p1).
+        return (self.stamp, *(self.probs or (None, None)))[i]
+
 
 class App:
     def __init__(self, args):
@@ -121,11 +129,14 @@ class App:
         self.locator_used = None
         self.pinned = False          # generation chosen here, not in the web UI
         self.blur_override = None    # None = whatever the model was trained with
-        # (t, P(open) left, P(open) right), one entry per frame, None where there
-        # was nothing to classify. Timestamped rather than merely ordered: the
-        # timeline plots against time, and monotonic() because this is an elapsed
-        # interval and must not move if the wall clock does.
+        # The Verdicts of the last HISTORY_SECONDS, one per frame. Whole Verdicts,
+        # not just (t, p0, p1): pausing lets any of these become the displayed and
+        # captured frame, so the pixels must still be here. ~75 frames of 640x360
+        # grey is ~17MB. Stamped with monotonic() because the timeline plots an
+        # elapsed interval that must not move if the wall clock does.
         self.history = deque()
+        self.paused = False
+        self.sel = 0                 # index into history while paused
         self.gens = self.registry.ids()
         self.load_model()
 
@@ -158,7 +169,7 @@ class App:
         dating it by completion would smear every reading by the processing time
         and make a slow pass look like a slow blink.
         """
-        self.history.append((v.stamp, *(v.probs or (None, None))))
+        self.history.append(v)
         cutoff = v.stamp - HISTORY_SECONDS
         while self.history and self.history[0][0] < cutoff:
             self.history.popleft()
@@ -374,6 +385,11 @@ class App:
         elif not self.model:
             state = "no model - capture samples and press t"
 
+        if self.paused:
+            # How far back the shown frame is; the state colour rule reads any
+            # non-"open" text as orange, which is right for a frozen view too.
+            state = f"PAUSED {v.stamp - self.history[-1][0]:.1f}s  {state}"
+
         ui.txt(annot, "DETECTION", ui.P(8, 22), 0.5, (0, 255, 0), 1.2)
         top = np.hstack([raw, annot])
 
@@ -400,8 +416,8 @@ class App:
             ("capture   " + "   ".join(f"{chr(k)} {name}"
                                        for k, (name, _l, _r) in CAPTURES.items()),
              0.38, (180, 180, 140)),
-            ("h hard case   t train pixel   p train pooled   g cycle generation"
-             "   b blur   q quit", 0.38, (150, 150, 150)),
+            ("h hard case   SPACE pause+scrub   t train pixel   p train pooled"
+             "   g cycle generation   b blur   q quit", 0.38, (150, 150, 150)),
         ])
         # Reversed to match the insets above, which match the picture. The index
         # into the history travels with its label so the two cannot be reordered
@@ -414,7 +430,8 @@ class App:
         strip = ui.timeline(top.shape[1], self.history,
                             self.history[-1][0] if self.history else v.stamp,
                             self.args.thresh, HISTORY_SECONDS, lanes,
-                            captures=pipe.capture.stamps if pipe else None)
+                            captures=pipe.capture.stamps if pipe else None,
+                            cursor=v.stamp if self.paused else None)
         return np.vstack([top, band, strip])
 
 
@@ -459,6 +476,26 @@ def main():
 
     cv2.namedWindow(WIN, cv2.WINDOW_NORMAL)
     cv2.resizeWindow(WIN, int(WIN_W * ui.S), int(WIN_H * ui.S))
+
+    def on_mouse(event, x, y, _flags, _param):
+        """Click the timeline strip while paused to select that frame.
+
+        The Qt backend reports image coordinates and calls this on the GUI
+        thread; the only write is one int, and history is frozen while paused,
+        so no lock. Inverts ui.timeline's xof; snapping to the nearest stamp
+        also clamps a click past either end.
+        """
+        if event != cv2.EVENT_LBUTTONDOWN or not app.paused or not app.history:
+            return
+        if y < int((360 + ui.INSET_H) * ui.S):  # strip is below frames + band
+            return
+        x0 = int(ui.TIMELINE_GUTTER * ui.S)
+        plot_w = max(int(2 * 640 * ui.S) - int(10 * ui.S) - x0, 1)
+        t = app.history[-1][0] - HISTORY_SECONDS * (1.0 - (x - x0) / plot_w)
+        app.sel = min(range(len(app.history)),
+                      key=lambda i: abs(app.history[i][0] - t))
+
+    cv2.setMouseCallback(WIN, on_mouse)
     try:
         loop(app, pipe)
     except KeyboardInterrupt:
@@ -498,19 +535,27 @@ def loop(app, pipe):
     was_visible = False
 
     while True:
-        item = pipe.results.get(0.05)
-        if item is not None:
-            latest = item[1]
-            app.absorb(latest)
-            app.poll()
-            cv2.imshow(WIN, app.render(latest, pipe))
-        elif latest is None:
-            # Nothing has been processed yet. Say why rather than showing a blank
-            # window: a pipeline that died looks exactly like one still starting.
-            for name, err in pipe.errors():
-                sys.exit(f"{name} thread died: {err!r}")
+        if app.paused:
+            # ponytail: a static frame redrawn at ~20Hz, so capture feedback and
+            # mouse selection show up without dirty-flag bookkeeping.
+            target = app.history[app.sel]
+            cv2.imshow(WIN, app.render(target, pipe))
+        else:
+            item = pipe.results.get(0.05)
+            if item is not None:
+                latest = item[1]
+                app.absorb(latest)
+                app.poll()
+                cv2.imshow(WIN, app.render(latest, pipe))
+            elif latest is None:
+                # Nothing has been processed yet. Say why rather than showing a
+                # blank window: a pipeline that died looks exactly like one still
+                # starting.
+                for name, err in pipe.errors():
+                    sys.exit(f"{name} thread died: {err!r}")
+            target = latest
 
-        key = cv2.waitKey(1) & 0xFF
+        key = cv2.waitKey(50 if app.paused else 1) & 0xFF
         if window_gone():
             if was_visible:
                 return
@@ -529,12 +574,24 @@ def loop(app, pipe):
             app.cycle_generation()
         elif key == ord("b"):
             app.cycle_blur()
-        elif latest is None:
+        elif key == ord(" "):
+            if app.paused:
+                app.paused = pipe.capture.paused = False
+            elif app.history:
+                # Newest frame selected; the pipeline gate idles the workers so a
+                # pause does not spend half a core on discarded inference.
+                app.paused = pipe.capture.paused = True
+                app.sel = len(app.history) - 1
+        elif app.paused and key == ord(","):
+            app.sel = max(app.sel - 1, 0)
+        elif app.paused and key == ord("."):
+            app.sel = min(app.sel + 1, len(app.history) - 1)
+        elif target is None:
             pass            # the keys below all act on a frame; there is none yet
         elif key == ord("h"):
-            app.capture_hard(latest.gray, latest.det)
+            app.capture_hard(target.gray, target.det)
         elif key in CAPTURES:
-            app.capture(latest.gray, latest.det, *CAPTURES[key])
+            app.capture(target.gray, target.det, *CAPTURES[key])
         elif key in (ord("+"), ord("=")):
             ui.S = min(ui.S + 0.25, 4.0)
             cv2.resizeWindow(WIN, int(WIN_W * ui.S), int(WIN_H * ui.S))

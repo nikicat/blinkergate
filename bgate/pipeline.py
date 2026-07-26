@@ -120,6 +120,7 @@ class CaptureLoop(_Loop):
         super().__init__(name)
         self.camera = camera
         self.out = out
+        self.paused = False                 # set from the UI thread; a plain bool
         self.stamps = deque(maxlen=512)     # every lit frame we captured
 
     def work(self):
@@ -127,6 +128,12 @@ class CaptureLoop(_Loop):
             gray = self.camera.read()
             if gray is None:                # unlit, or a failed read; the camera
                 continue                    # counts those two separately
+            if self.paused:
+                # Still reading: the drain keeps the driver's buffer fresh so
+                # resume shows now, not a frame from when the pause began. But
+                # nothing is enqueued, so the workers sit idle instead of
+                # spending inference on frames nobody will look at.
+                continue
             stamp = time.monotonic()
             self.stamps.append(stamp)
             self.out.put(stamp, gray)
