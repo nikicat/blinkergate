@@ -233,6 +233,23 @@ def time_x(t, now, window, x0, plot_w):
     return int(round(x0 + min(max(frac, 0.0), 1.0) * plot_w))
 
 
+def axis_now(pts, fallback=0.0):
+    """The right edge of the time axis: one median interval past the newest
+    sample.
+
+    With the edge AT the newest stamp, the current frame's span was empty and it
+    drew as a sliver. Held for a median frame it gets the width every other
+    sample got when it was newest. Capped by TIMELINE_GAP so a stall does not
+    stretch it, and shared with the click handler, which must map pixels with
+    the same axis the bars were drawn on.
+    """
+    if not pts:
+        return fallback
+    gaps = sorted(b[0] - a[0] for a, b in zip(pts, list(pts)[1:]))
+    hold = min(gaps[len(gaps) // 2], TIMELINE_GAP) if gaps else TIMELINE_GAP
+    return pts[-1][0] + hold
+
+
 def timeline(width, history, now, thresh, window, lanes, frame_time=True,
              captures=None, cursor=None):
     """Time-synced lanes of P(open), most recent at the right edge.
@@ -270,6 +287,7 @@ def timeline(width, history, now, thresh, window, lanes, frame_time=True,
     x0, x1 = int(TIMELINE_GUTTER * S), width - int(10 * S)
     plot_w = max(x1 - x0, 1)
     pts = list(history)
+    now = max(now, axis_now(pts, now))
 
     def xof(t):
         return time_x(t, now, window, x0, plot_w)
@@ -372,9 +390,7 @@ def timeline(width, history, now, thresh, window, lanes, frame_time=True,
         # under it.
         nxt = next((e[0] for e in pts if e[0] > cursor), now)
         xa = xof(cursor)
-        # At least a pixel, so the newest frame - whose span to "now" is empty -
-        # still shows: its bar hangs just past the now tick, into the margin.
-        xb = max(min(xof(nxt), x1), xa + 1)
+        xb = max(min(xof(nxt), x1), xa + 1)     # at least a pixel, regardless
         tint = np.full((panel.shape[0], xb - xa, 3), (0, 220, 255), np.uint8)
         panel[:, xa:xb] = cv2.addWeighted(panel[:, xa:xb], 0.65, tint, 0.35, 0)
     return panel

@@ -497,10 +497,11 @@ def main():
         plot_w = max(int(2 * 640 * ui.S) - int(10 * ui.S) - x0, 1)
         # The frame whose SPAN contains the click - a sample holds until the
         # next one arrives, and the selection bar is drawn over that same span.
-        # Selected in PIXEL space with the timeline's own rounding: inverting to
-        # time picked the neighbour on boundary pixels, and nearest-stamp would
-        # paint the bar to the right of a click past a span's midpoint.
-        now = app.history[-1][0]
+        # Selected in PIXEL space with the timeline's own rounding and axis:
+        # inverting to time picked the neighbour on boundary pixels, and
+        # nearest-stamp would paint the bar to the right of a click past a
+        # span's midpoint.
+        now = ui.axis_now(app.history)
         xs = [ui.time_x(h[0], now, HISTORY_SECONDS, x0, plot_w)
               for h in app.history]
         app.sel = max(bisect_right(xs, x) - 1, 0)
