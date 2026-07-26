@@ -16,10 +16,10 @@ and this picks it up within a second, without a restart.
   g  cycle generation: follow-the-web-UI, then each one in turn
   b  override the blur (diagnostic, pixel models only - see below)
   q  quit               + -  resize              f  fullscreen
-  SPACE  pause; click the timeline (or step with , .) to revisit any frame of
-         the last 10 seconds - the capture keys then save THAT frame. For
-         grabbing a misdetection after you saw it: a blink is ~one frame, gone
-         before you can press anything live.
+  SPACE  pause; click the timeline, or step with the arrow keys, to revisit
+         any frame of the last 10 seconds - the capture keys then save THAT
+         frame. For grabbing a misdetection after you saw it: a blink is ~one
+         frame, gone before you can press anything live.
 
 Two kinds of model, and `g` is how you compare them. The pixel one reads 960 fixed
 pixels, so the pupil has to be where it was during training; the pooled one
@@ -62,6 +62,7 @@ always-freshest and never-buffered.
 import argparse
 import sys
 import time
+from bisect import bisect_right
 from collections import deque
 
 from bgate import qtfix  # noqa: F401  - must be imported before cv2
@@ -88,6 +89,10 @@ CAPTURES = {
     ord("1"): ("YOUR LEFT shut", data.CLOSED, data.OPEN),
     ord("2"): ("YOUR RIGHT shut", data.OPEN, data.CLOSED),
 }
+# waitKeyEx codes for the arrows: the X11 keysym and the Qt keycode, because
+# which one arrives depends on the highgui backend the wheel was built with.
+K_LEFT = {65361, 16777234}
+K_RIGHT = {65363, 16777236}
 
 
 class Verdict:
@@ -482,8 +487,7 @@ def main():
 
         The Qt backend reports image coordinates and calls this on the GUI
         thread; the only write is one int, and history is frozen while paused,
-        so no lock. Inverts ui.timeline's xof; snapping to the nearest stamp
-        also clamps a click past either end.
+        so no lock. Inverts ui.timeline's xof.
         """
         if event != cv2.EVENT_LBUTTONDOWN or not app.paused or not app.history:
             return
@@ -491,9 +495,15 @@ def main():
             return
         x0 = int(ui.TIMELINE_GUTTER * ui.S)
         plot_w = max(int(2 * 640 * ui.S) - int(10 * ui.S) - x0, 1)
-        t = app.history[-1][0] - HISTORY_SECONDS * (1.0 - (x - x0) / plot_w)
-        app.sel = min(range(len(app.history)),
-                      key=lambda i: abs(app.history[i][0] - t))
+        # The frame whose SPAN contains the click - a sample holds until the
+        # next one arrives, and the selection bar is drawn over that same span.
+        # Selected in PIXEL space with the timeline's own rounding: inverting to
+        # time picked the neighbour on boundary pixels, and nearest-stamp would
+        # paint the bar to the right of a click past a span's midpoint.
+        now = app.history[-1][0]
+        xs = [ui.time_x(h[0], now, HISTORY_SECONDS, x0, plot_w)
+              for h in app.history]
+        app.sel = max(bisect_right(xs, x) - 1, 0)
 
     cv2.setMouseCallback(WIN, on_mouse)
     try:
@@ -555,7 +565,11 @@ def loop(app, pipe):
                     sys.exit(f"{name} thread died: {err!r}")
             target = latest
 
-        key = cv2.waitKey(50 if app.paused else 1) & 0xFF
+        # waitKeyEx, because the arrows vanish under & 0xFF. The mask is still
+        # right for the ASCII keys and cannot collide: an arrow's low byte is a
+        # capital letter or a control code, and every binding here is lowercase.
+        raw = cv2.waitKeyEx(50 if app.paused else 1)
+        key = raw & 0xFF
         if window_gone():
             if was_visible:
                 return
@@ -582,9 +596,9 @@ def loop(app, pipe):
                 # pause does not spend half a core on discarded inference.
                 app.paused = pipe.capture.paused = True
                 app.sel = len(app.history) - 1
-        elif app.paused and key == ord(","):
+        elif app.paused and (raw in K_LEFT or key == ord(",")):
             app.sel = max(app.sel - 1, 0)
-        elif app.paused and key == ord("."):
+        elif app.paused and (raw in K_RIGHT or key == ord(".")):
             app.sel = min(app.sel + 1, len(app.history) - 1)
         elif target is None:
             pass            # the keys below all act on a frame; there is none yet

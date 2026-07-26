@@ -222,6 +222,17 @@ def _frame_lane(panel, top, bot, x0, x1, xof, pts, captures=None):
                            y - int(3 * S)), 0.26, (215, 215, 220))
 
 
+def time_x(t, now, window, x0, plot_w):
+    """The timeline's time -> x pixel mapping.
+
+    A module function rather than a closure so the click handler can use the
+    SAME rounding: selecting by inverting the maths in time space picked the
+    wrong frame on boundary pixels, where int(round()) had moved an edge.
+    """
+    frac = 1.0 - (now - t) / window
+    return int(round(x0 + min(max(frac, 0.0), 1.0) * plot_w))
+
+
 def timeline(width, history, now, thresh, window, lanes, frame_time=True,
              captures=None, cursor=None):
     """Time-synced lanes of P(open), most recent at the right edge.
@@ -248,8 +259,8 @@ def timeline(width, history, now, thresh, window, lanes, frame_time=True,
     ``frame_time`` adds a third lane of the interval between frames, sharing the
     same x mapping so a stall lines up with whatever the eyes were doing during it.
 
-    ``cursor`` is a stamp to mark with a vertical line - the frame selected while
-    paused.
+    ``cursor`` is the stamp of the frame selected while paused, highlighted as a
+    bar over that frame's whole span.
     """
     lane_h = int(LANE_H * S)
     head_h = int(TIMELINE_HEAD * S)
@@ -261,8 +272,7 @@ def timeline(width, history, now, thresh, window, lanes, frame_time=True,
     pts = list(history)
 
     def xof(t):
-        frac = 1.0 - (now - t) / window
-        return int(round(x0 + min(max(frac, 0.0), 1.0) * plot_w))
+        return time_x(t, now, window, x0, plot_w)
 
     # How long each sample stands for: until the next one, or until now for the
     # newest, and never across a dropout. Computed once and shared, because the
@@ -354,10 +364,19 @@ def timeline(width, history, now, thresh, window, lanes, frame_time=True,
             lx = min(x + int(2 * S), width - text_width(label, 0.32) - int(3 * S))
             txt(panel, label, (lx, int(12 * S)), 0.32, (120, 120, 128))
 
-    if cursor is not None:
-        x = xof(cursor)
-        cv2.line(panel, (x, 0), (x, panel.shape[0]), (0, 220, 255),
-                 max(1, int(S)))
+    if cursor is not None and pts:
+        # The span runs to the NEXT sample, deliberately ignoring TIMELINE_GAP:
+        # this is a selection highlight, not a data claim, and only bars that
+        # tile the axis keep the promise that the click lands inside the bar it
+        # selected. Tinted rather than painted, so the trace stays readable
+        # under it.
+        nxt = next((e[0] for e in pts if e[0] > cursor), now)
+        xa = xof(cursor)
+        # At least a pixel, so the newest frame - whose span to "now" is empty -
+        # still shows: its bar hangs just past the now tick, into the margin.
+        xb = max(min(xof(nxt), x1), xa + 1)
+        tint = np.full((panel.shape[0], xb - xa, 3), (0, 220, 255), np.uint8)
+        panel[:, xa:xb] = cv2.addWeighted(panel[:, xa:xb], 0.65, tint, 0.35, 0)
     return panel
 
 
