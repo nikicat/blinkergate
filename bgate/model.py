@@ -261,8 +261,13 @@ class EyeModel(CropSource):
         return os.path.exists(path)
 
     def describe(self):
-        """One line for the live view header."""
-        return f"pixel  blur {self.blur}  norm {self.normalise}"
+        """Short enough for the live view header, which has finite width.
+
+        Normalisation is named only when it is *not* the current default: a
+        constant costs the same pixels as an anomaly and tells you less.
+        """
+        out = f"pixel  blur {self.blur}"
+        return out if self.normalise == NORMALISE else f"{out}  norm {self.normalise}"
 
     def save(self, path=DEFAULT_PATH):
         np.savez(path, coef=self.coef, intercept=self.intercept,

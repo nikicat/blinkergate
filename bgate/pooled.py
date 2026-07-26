@@ -193,11 +193,13 @@ class PooledModel(model.CropSource):
                  int(idx[0, k] % pw) + half) for k in range(len(self.kernels))]
 
     def describe(self):
-        """One line for the live view header."""
-        k = len(self.kernels)
-        return (f"pooled  {k}x{self.size}x{self.size} kernels"
-                f"{' + position' if self.use_position else ''}"
-                f"  norm {self.normalise}")
+        """Short enough for the live view header, which has finite width - the
+        long form ran off the right edge. Same rule as the pixel model: name the
+        normalisation only when it is not the current default."""
+        out = f"pooled  {len(self.kernels)}x{self.size}x{self.size}"
+        if self.use_position:
+            out += "+pos"
+        return out if self.normalise == NORMALISE else f"{out}  norm {self.normalise}"
 
     def save(self, path):
         np.savez(path, kernels=self.kernels, coef=self.coef,

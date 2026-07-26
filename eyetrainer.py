@@ -232,9 +232,9 @@ class App:
             return self.status
         text = (f"{self.model_gen}  {self.model.describe()}"
                 f"  ({self.model.accuracy:.1%} held-out)")
-        text += "  [pinned]" if self.pinned else "  [following web UI]"
+        text += "  [pinned]" if self.pinned else "  [web UI]"
         if len(self.gens) > 1:
-            text += f"  ({len(self.gens)} generations)"
+            text += f"  ({len(self.gens)} gens)"
         if self.blur_mismatch():
             text += f"  MISMATCH: trained with {self.trained_blur}"
         return text
@@ -304,8 +304,13 @@ class App:
              + (f"  via {self.locator_used}" if self.locator_used else ""),
              0.45, (200, 200, 120)),
             (self.model_line(), 0.42, self.model_colour()),
-            ("o/c/1/2 capture   h hard case   t train pixel   p train pooled   "
-             "g gen   q quit", 0.38, (150, 150, 150)),
+            # Built from CAPTURES rather than written out, so the legend cannot
+            # come to disagree with what the keys actually do.
+            ("capture   " + "   ".join(f"{chr(k)} {name}"
+                                       for k, (name, _l, _r) in CAPTURES.items()),
+             0.38, (180, 180, 140)),
+            ("h hard case   t train pixel   p train pooled   g cycle generation"
+             "   b blur   q quit", 0.38, (150, 150, 150)),
         ])
         return np.vstack([top, band])
 
