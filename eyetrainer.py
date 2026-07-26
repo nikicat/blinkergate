@@ -578,8 +578,12 @@ class App:
             # (t, raw_l, raw_r, sub_l, sub_r), so the subtracted lanes are just
             # positions 2 and 3. Same rule as ever - the index travels with its
             # label - and the lanes shrink to fit rather than the strip growing.
-            lanes = ([(p, f"{tag} raw") for p, tag in lanes]
-                     + [(p + 2, f"{tag} sub") for p, tag in lanes])
+            # Grouped by EYE, not by mode: the comparison is between the two
+            # preprocessings of the SAME eye, so those two lanes go adjacent
+            # where a disagreement reads as one lane stepping and its neighbour
+            # not. Grouped by mode, the pair to compare sat two lanes apart.
+            lanes = [lane for p, tag in lanes
+                     for lane in ((p, f"{tag} raw"), (p + 2, f"{tag} sub"))]
         # "now" is the newest CAPTURE, not the wall clock: the right edge should be
         # the last thing the camera saw, so a stalled camera freezes the plot
         # instead of scrolling an ever-widening blank off to the right.
