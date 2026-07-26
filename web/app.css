@@ -65,7 +65,7 @@ kbd {
   color: var(--muted);
 }
 
-select {
+select, input[type="search"] {
   background: #262b33;
   color: var(--text);
   border: 1px solid var(--line);
@@ -73,6 +73,7 @@ select {
   padding: 5px 8px;
   font: inherit;
 }
+input[type="search"] { font: 12px ui-monospace, monospace; }
 
 .toolbar {
   display: flex;
@@ -121,11 +122,24 @@ select {
 .cell .meta {
   display: flex;
   justify-content: space-between;
+  gap: 6px;
   font: 11px ui-monospace, monospace;
   padding: 3px 5px;
   color: var(--muted);
 }
 .cell.conflict .meta { color: var(--bad); font-weight: 600; }
+.cell .sid {
+  /* Stays muted even on a conflict row: it is an identifier, not a signal. */
+  color: var(--muted);
+  font-weight: 400;
+  cursor: copy;
+  user-select: text;
+  /* Nine characters always fit. Only the fallback to a full id can overflow,
+     and the tooltip carries that in full. */
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+.cell .sid:hover { color: var(--accent); }
 
 table { width: calc(100% - 36px); margin: 0 18px 40px; border-collapse: collapse; }
 th, td { text-align: left; padding: 8px 10px; border-bottom: 1px solid var(--line); }

@@ -45,10 +45,14 @@
         <option value="conflict">disagrees with model</option>
       </select>
     </label>
+    <label>Find
+      <input id="find" type="search" placeholder="paste a sample id" size="22">
+    </label>
     <span class="spacer"></span>
     <span id="selcount" class="muted">0 selected</span>
     <button id="sel-all">Select shown</button>
     <button id="sel-none">Clear</button>
+    <button id="copy-ids">Copy ids</button>
     <span class="sep"></span>
     <button class="label-btn open" data-label="open">Open <kbd>o</kbd></button>
     <button class="label-btn closed" data-label="closed">Closed <kbd>c</kbd></button>
@@ -61,6 +65,9 @@
     eye appears on the right of the picture.
     Nothing is ever deleted &mdash; <strong>skip</strong> only excludes a sample
     from training, and relabelling brings it back.
+    Each cell shows its <strong>sample id</strong> &mdash; click it to copy,
+    hover for the full one. <strong>Copy ids</strong> takes the selection, or
+    everything shown; <strong>Find</strong> accepts either spelling.
   </p>
   <div id="grid" class="grid"></div>
 </section>

@@ -30,6 +30,24 @@ async function api(path, options) {
 
 // --- dataset ---------------------------------------------------------------
 
+// `sid` is the server's short handle for a sample - see data.short_id. It is an
+// encoding rather than a hash, so it is unique by construction and the Python
+// side can decode whatever gets quoted back.
+function shortId(s) {
+  return s.sid || s.id;
+}
+
+async function copyIds(ids) {
+  try {
+    await navigator.clipboard.writeText(ids.join("\n"));
+    toast(ids.length === 1 ? `copied ${ids[0]}` : `copied ${ids.length} ids`);
+  } catch {
+    // The clipboard API needs a secure context. 127.0.0.1 is one, but say so
+    // rather than failing silently if it is ever served from anywhere else.
+    toast("could not reach the clipboard — select the id and copy it", 5000);
+  }
+}
+
 function conflicts(s) {
   return s.p_closed !== null && s.label !== "skip" &&
          (s.p_closed > 0.5) !== (s.label === "closed");
@@ -65,11 +83,18 @@ function uncertainty(s) {
 function visible() {
   const f = $("#filter").value;
   const eye = $("#eye").value;
+  const find = $("#find").value.trim().toLowerCase();
   let rows = state.samples;
   if (eye !== "all") rows = rows.filter((s) => s.side === eye);
   if (f === "trainable") rows = rows.filter((s) => s.label !== "skip");
   else if (f === "conflict") rows = rows.filter(conflicts);
   else if (f !== "all") rows = rows.filter((s) => s.label === f);
+  // Matched against both spellings, so pasting back either the copied id or the
+  // short form off the screen finds the sample.
+  if (find) {
+    rows = rows.filter((s) =>
+      `${s.id} ${shortId(s)}`.toLowerCase().includes(find));
+  }
   return rows.slice().sort(sortKey($("#sort").value));
 }
 
@@ -88,12 +113,19 @@ function render() {
 
     const meta = document.createElement("div");
     meta.className = "meta";
-    const left = document.createElement("span");
-    // "img_left" is the subject's left eye - on the RIGHT of the picture.
-    left.textContent = s.side === "img_left" ? "your L" : "your R";
+    const sid = document.createElement("span");
+    sid.className = "sid";
+    sid.textContent = shortId(s);
+    // The side is in the tooltip rather than the row: it is the same two values
+    // for every sample and the Eye filter already says which you are looking at.
+    sid.title = `${shortId(s)}\n${s.id}\nclick to copy`;
+    // Copies instead of selecting: the cell's own click handler would otherwise
+    // toggle selection, and reading an id off the screen to retype it is exactly
+    // what this is here to avoid.
+    sid.onclick = (event) => { event.stopPropagation(); copyIds([shortId(s)]); };
     const right = document.createElement("span");
     right.textContent = s.p_closed === null ? "-" : `p${s.p_closed.toFixed(2)}`;
-    meta.append(left, right);
+    meta.append(sid, right);
 
     cell.append(img, meta);
     return cell;
@@ -231,11 +263,19 @@ document.querySelectorAll(".label-btn").forEach((b) => {
 $("#sort").onchange = render;
 $("#filter").onchange = () => { state.lastIndex = null; render(); };
 $("#eye").onchange = () => { state.lastIndex = null; render(); };
+$("#find").oninput = () => { state.lastIndex = null; render(); };
 $("#sel-all").onclick = () => {
   state.shown.forEach((s) => state.selected.add(s.id));
   render();
 };
 $("#sel-none").onclick = () => { state.selected.clear(); state.lastIndex = null; render(); };
+$("#copy-ids").onclick = () => {
+  const ids = state.selected.size
+    ? state.shown.filter((s) => state.selected.has(s.id)).map(shortId)
+    : state.shown.map(shortId);
+  if (!ids.length) return toast("nothing to copy");
+  copyIds(ids);
+};
 
 $("#train").onclick = async (event) => {
   const button = event.target;

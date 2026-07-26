@@ -81,6 +81,10 @@ def create_app(ds_dir="dataset", models_dir="models"):
             "samples": [
                 {
                     "id": s["id"],
+                    # Computed here, not in the browser: the analysis scripts
+                    # have to resolve whatever gets quoted back, so there is one
+                    # implementation of the encoding and it lives in Python.
+                    "sid": data.short_id(s["frame"], s["side"]),
                     "frame": s["frame"],
                     "side": s["side"],
                     "label": s["label"],

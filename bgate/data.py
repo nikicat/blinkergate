@@ -71,6 +71,56 @@ def sample_id(frame, side):
     return f"{frame}|{side}"
 
 
+# Short ids exist to be quoted - read off a thumbnail, pasted into a message,
+# typed back into the filter box. "1785009958372_000.png|img_left" is 30
+# characters of which 29 are boilerplate or shared prefix.
+#
+# Deliberately an ENCODING, not a hash. A hash short enough to be worth having
+# would collide: 1120 samples into 5 base32 characters is a ~2% chance of two
+# samples sharing a handle, and the failure is silent and points at the wrong
+# picture. This packs (stamp, index, side) into one integer and writes it in
+# base36, so it is bijective by construction and decodes without the dataset.
+SHORT_EPOCH_MS = 1_780_000_000_000        # fixed, so a code quoted today still
+_B36 = "0123456789abcdefghijklmnopqrstuvwxyz"   # resolves to the same sample
+
+
+def _b36(n):
+    out = []
+    while n:
+        n, r = divmod(n, 36)
+        out.append(_B36[r])
+    return "".join(reversed(out)) or "0"
+
+
+def short_id(frame, side):
+    """Nine-ish characters identifying one eye of one frame.
+
+    Falls back to the full id for anything that does not parse, because a handle
+    that silently means a different sample is worse than a long one.
+    """
+    stem = frame[:-4] if frame.endswith(".png") else frame
+    stamp, _sep, index = stem.partition("_")
+    try:
+        delta = int(stamp) - SHORT_EPOCH_MS
+        if delta < 0:
+            raise ValueError("frame predates the short-id epoch")
+        return _b36(delta * 2000 + int(index) * 2 + (side == SIDES[1][0]))
+    except ValueError:
+        return sample_id(frame, side)
+
+
+def parse_short_id(code):
+    """``(frame, side)`` from a short id. Inverse of :func:`short_id`."""
+    if "|" in code:                     # a full id that short_id declined to pack
+        frame, _sep, side = code.partition("|")
+        return frame, side
+    n = int(code.strip().lower(), 36)
+    side = SIDES[1][0] if n % 2 else SIDES[0][0]
+    n //= 2
+    stamp = n // 1000 + SHORT_EPOCH_MS
+    return f"{stamp}_{n % 1000:03d}.png", side
+
+
 def burst_of(frame):
     """The capture burst a frame belongs to. Frames from one key press share a
     stamp, which is what lets validation hold out whole bursts."""
