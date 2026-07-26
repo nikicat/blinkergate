@@ -42,7 +42,14 @@ def enlarge(gray):
 
 
 def iris_circle(shape, lm, iris):
-    """Centre and radius of the iris in pixels of the given image shape."""
+    """Centre and radius of the iris in pixels of the given image shape.
+
+    Nothing in the live view uses this - the preview is framed by the crop's own
+    affine now. It stays because it is the mesh's *independent* estimate of where
+    the pupil is, and comparing it against a blob found in the pixels is what
+    separates a mislocated crop from an off-centre gaze (see FINDINGS, "Where the
+    pupil actually is"). Deleting it would remove one side of that measurement.
+    """
     h, w = shape[:2]
     p = np.array([[lm[i].x * w, lm[i].y * h] for i in iris])
     c = p[0]
@@ -92,37 +99,50 @@ def draw_face_frame(img, lm, roll=0.0, colour=(0, 200, 255), label=None):
     return quad
 
 
-def eye_inset(gray, lm, ring, iris, title, p_open, shut, extra=None):
-    """One eye, magnified, with its state. Reports the true source width so it is
-    always clear how many real pixels the decision came from."""
+# How much of the eye's surroundings the preview shows, in eye widths. Wider than
+# the crop's own PAD_W so the crop outline has margin around it and you can see
+# what was left out.
+INSET_PAD = 2.6
+
+
+def eye_inset(gray, m, lm, ring, quad, title, p_open, shut, extra=None):
+    """One eye, magnified and **levelled the way the classifier sees it**.
+
+    ``m`` is the affine into this window, from :func:`bgate.data.level_affine`, so
+    the preview shares its definition of upright with the training crop. ``quad``
+    is the region actually sampled, in source pixels; drawn here it shows exactly
+    which pixels the verdict came from and how much context was discarded.
+
+    This used to be an axis-aligned cut centred on the iris, which disagreed with
+    the crop on rotation, centre and scale at once - a preview that could not
+    display the misframing it exists to reveal.
+    """
     out_w, out_h = int(INSET_W * S), int(INSET_H * S)
     h, w = gray.shape[:2]
-    pts = np.array([[lm[i].x * w, lm[i].y * h] for i in ring])
-    cx, cy, _rad = iris_circle(gray.shape, lm, iris)
+    view = cv2.warpAffine(gray, m, (out_w, out_h), flags=cv2.INTER_NEAREST,
+                          borderMode=cv2.BORDER_REPLICATE)
+    view = cv2.cvtColor(view, cv2.COLOR_GRAY2BGR)
 
-    half_w = max((pts[:, 0].max() - pts[:, 0].min()) * 0.9, 10)
-    half_h = half_w * out_h / out_w
-    x0, x1 = int(max(0, cx - half_w)), int(min(w, cx + half_w))
-    y0, y1 = int(max(0, cy - half_h)), int(min(h, cy + half_h))
-    if x1 <= x0 + 1 or y1 <= y0 + 1:
-        return np.zeros((out_h, out_w, 3), np.uint8)
-
-    src_w = x1 - x0
-    crop = cv2.cvtColor(gray[y0:y1, x0:x1], cv2.COLOR_GRAY2BGR)
-    sx, sy = out_w / crop.shape[1], out_h / crop.shape[0]
-    crop = cv2.resize(crop, (out_w, out_h), interpolation=cv2.INTER_NEAREST)
+    def into_view(pts):
+        return (np.asarray(pts, np.float32) @ m[:, :2].T + m[:, 2]).astype(np.int32)
 
     color = (0, 0, 255) if shut else (0, 255, 0)
-    lid = np.array([[(p[0] - x0) * sx, (p[1] - y0) * sy] for p in pts], np.int32)
-    cv2.polylines(crop, [lid], True, color, max(1, int(round(S * 0.7))), cv2.LINE_AA)
+    lid = into_view([[lm[i].x * w, lm[i].y * h] for i in ring])
+    cv2.polylines(view, [lid], True, color, max(1, int(round(S * 0.7))), cv2.LINE_AA)
+    # The crop, in the preview's own coordinates. Axis-aligned here by
+    # construction, because both were levelled by the same angle - if it ever
+    # looks tilted, the two have come apart.
+    cv2.polylines(view, [into_view(quad)], True, (0, 200, 255),
+                  max(1, int(round(S * 0.6))), cv2.LINE_AA)
 
-    txt(crop, f"{title}  {'SHUT' if shut else 'OPEN'}", P(6, 22), 0.6, color, 1.6)
-    txt(crop, f"P(open) {p_open:.3f}", P(6, 46), 0.5, color, 1.2)
+    src_w = int(round(float(np.linalg.norm(np.asarray(quad[1]) - np.asarray(quad[0])))))
+    txt(view, f"{title}  {'SHUT' if shut else 'OPEN'}", P(6, 22), 0.6, color, 1.6)
+    txt(view, f"P(open) {p_open:.3f}", P(6, 46), 0.5, color, 1.2)
     if extra:
-        txt(crop, extra, P(6, 68), 0.42, (200, 200, 120), 1.2)
-    txt(crop, f"{src_w}px wide  ->  {out_w // max(src_w, 1)}x",
+        txt(view, extra, P(6, 68), 0.42, (200, 200, 120), 1.2)
+    txt(view, f"crop {src_w}px wide  ->  {out_w // max(src_w, 1)}x",
         P(6, INSET_H - 10), 0.42, (185, 185, 185))
-    return crop
+    return view
 
 
 def inset_row(left_in, right_in, width, lines):

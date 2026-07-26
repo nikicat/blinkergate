@@ -265,12 +265,22 @@ class App:
                 cv2.polylines(annot, [(quad * ui.S).astype(np.int32)], True,
                               (0, 0, 255) if is_shut else (0, 255, 0),
                               max(1, int(ui.S * 0.6)), cv2.LINE_AA)
-            insets = [
-                ui.eye_inset(gray, lm, ring,
-                             ui.IRIS_L if side == "img_left" else ui.IRIS_R,
-                             tag, p if p is not None else 1.0, sh)
-                for (side, ring, tag), p, sh in zip(data.SIDES, probs, shut)
-            ]
+            # Framed by the same affine the crop was cut with, so the preview is
+            # levelled exactly as the classifier's input is - just larger, and
+            # with the sampled region outlined inside it.
+            h, w = gray.shape[:2]
+            out_w = int(ui.INSET_W * ui.S)
+            out_h = int(ui.INSET_H * ui.S)
+            insets = []
+            for (side, ring, tag), p, sh, quad in zip(data.SIDES, probs, shut,
+                                                      quads):
+                cx, cy, width = data.eye_centre(
+                    lm, ring, w, h, det.roll if self.model.level_width else 0.0)
+                half_w = max(width * ui.INSET_PAD / 2, 12)
+                m = data.level_affine(cx, cy, half_w, half_w * out_h / out_w,
+                                      det.roll, out_w, out_h)
+                insets.append(ui.eye_inset(gray, m, lm, ring, quad, tag,
+                                           p if p is not None else 1.0, sh))
             state = ("BOTH SHUT" if all(shut) else
                      "YOUR LEFT shut" if shut[0] else
                      "YOUR RIGHT shut" if shut[1] else "open")
@@ -285,8 +295,12 @@ class App:
         band = ui.inset_row(insets[1], insets[0], top.shape[1], [
             (state, 0.85,
              (0, 165, 255) if state not in ("open", "no face") else (150, 150, 150)),
+            # This frame's roll, not the tracked one: it is the angle the crops
+            # were actually levelled by, and showing the tracker's instead put two
+            # different numbers on screen under the same name.
             (f"dataset: {counts[data.OPEN]} open / {counts[data.CLOSED]} closed / "
-             f"{counts[data.SKIP]} skip    roll {self.roll:+.0f}deg"
+             f"{counts[data.SKIP]} skip    roll "
+             f"{det.roll if det else self.roll:+.0f}deg"
              + (f"  via {self.locator_used}" if self.locator_used else ""),
              0.45, (200, 200, 120)),
             (self.model_line(), 0.42, self.model_colour()),

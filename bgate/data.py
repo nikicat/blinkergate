@@ -158,16 +158,7 @@ def crop_at(gray, cx, cy, eye_width, pad_w=PAD_W, pad_h=PAD_H, roll=0.0):
     half_h = half_w * (IN_H / IN_W) * pad_h
 
     if roll:
-        # One warp straight to the output size: rotate about the eye, scale each
-        # axis so the crop maps to IN_W x IN_H, then put the eye at the centre of
-        # the output. Scaling per axis rather than uniformly is what makes this
-        # agree with the branch below for any pad_h, not only pad_h=1.
-        th = math.radians(roll)
-        cos, sin = math.cos(th), math.sin(th)
-        sx, sy = IN_W / (2 * half_w), IN_H / (2 * half_h)
-        m = np.array([[sx * cos, sx * sin, 0.0],
-                      [-sy * sin, sy * cos, 0.0]])
-        m[:, 2] = (IN_W / 2, IN_H / 2) - m[:, :2] @ (cx, cy)
+        m = level_affine(cx, cy, half_w, half_h, roll, IN_W, IN_H)
         crop = cv2.warpAffine(gray, m, (IN_W, IN_H), flags=cv2.INTER_AREA,
                               borderMode=cv2.BORDER_REPLICATE)
         return crop, crop_quad(cx, cy, half_w, half_h, roll)
@@ -180,6 +171,29 @@ def crop_at(gray, cx, cy, eye_width, pad_w=PAD_W, pad_h=PAD_H, roll=0.0):
         return None, quad
     crop = cv2.resize(gray[y0:y1, x0:x1], (IN_W, IN_H), interpolation=cv2.INTER_AREA)
     return crop, quad
+
+
+def level_affine(cx, cy, half_w, half_h, roll, out_w, out_h):
+    """Affine taking source pixels into a levelled window of ``out_w x out_h``
+    centred on the eye.
+
+    One warp straight to the output size: rotate about the eye, scale each axis so
+    the region maps to the window, then put the eye at the window's centre.
+    Scaling per axis rather than uniformly is what makes this agree with an
+    axis-aligned box for any pad_h, not only pad_h=1.
+
+    The single definition of *levelled*, used both for the training crop and for
+    the live view's magnified preview - so what you watch is framed exactly the
+    way the classifier reads it. It was not, and an axis-aligned preview cannot
+    show a rotated crop being wrong.
+    """
+    th = math.radians(roll)
+    cos, sin = math.cos(th), math.sin(th)
+    sx, sy = out_w / (2 * half_w), out_h / (2 * half_h)
+    m = np.array([[sx * cos, sx * sin, 0.0],
+                  [-sy * sin, sy * cos, 0.0]])
+    m[:, 2] = (out_w / 2, out_h / 2) - m[:, :2] @ (cx, cy)
+    return m
 
 
 def crop_quad(cx, cy, half_w, half_h, roll):
