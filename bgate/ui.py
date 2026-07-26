@@ -261,20 +261,31 @@ def timeline(width, history, now, thresh, window, lanes, frame_time=True,
         frac = 1.0 - (now - t) / window
         return int(round(x0 + min(max(frac, 0.0), 1.0) * plot_w))
 
+    # How long each sample stands for: until the next one, or until now for the
+    # newest, and never across a dropout. Computed once and shared, because the
+    # background and the trace have to agree about it - two loops deriving the
+    # same intervals separately is how they come apart.
+    spans = []
+    for j, entry in enumerate(pts):
+        t = entry[0]
+        t_end = min(pts[j + 1][0] if j + 1 < len(pts) else now, t + TIMELINE_GAP)
+        spans.append((t, t_end))
+
     for i, (pos, tag) in enumerate(lanes):
         top = head_h + i * lane_h
         bot = top + lane_h - int(3 * S)
         span = bot - top - 2
         panel[top:bot, x0:x1] = NODATA_BG
+        thick = max(1, int(round(S * 0.7)))
 
-        # Piecewise-constant background: each sample holds until the next one, or
-        # until now for the newest. That is what a discrete sample means.
-        for j, entry in enumerate(pts):
-            t, p = entry[0], entry[1 + pos]
-            t_end = pts[j + 1][0] if j + 1 < len(pts) else now
-            t_end = min(t_end, t + TIMELINE_GAP)
-            xa, xb = xof(t), max(xof(t_end), xof(t) + 1)
-            xa, xb = max(xa, x0), min(xb, x1)
+        def bounds(t, t_end):
+            return (max(xof(t), x0), min(max(xof(t_end), xof(t) + 1), x1))
+
+        # Piecewise-constant background: each sample holds for its span. That is
+        # what a discrete sample means.
+        for (t, t_end), entry in zip(spans, pts):
+            p = entry[1 + pos]
+            xa, xb = bounds(t, t_end)
             if xb > xa:
                 panel[top:bot, xa:xb] = (
                     NODATA_BG if p is None else
@@ -283,17 +294,26 @@ def timeline(width, history, now, thresh, window, lanes, frame_time=True,
         cv2.line(panel, (x0, bot - int(thresh * span) - 1),
                  (x1, bot - int(thresh * span) - 1), (110, 110, 120), 1)
 
-        prev = None
-        for entry in pts:
-            t, p = entry[0], entry[1 + pos]
+        # A staircase, not a polyline: the trace holds flat across a sample's span
+        # and steps at the boundary, which is the same claim the background colour
+        # makes. Sloping between samples asserts a ramp through time nobody
+        # measured, and it disagreed with the block of colour underneath it.
+        prev_y = prev_end = None
+        for (t, t_end), entry in zip(spans, pts):
+            p = entry[1 + pos]
             if p is None:
-                prev = None
+                prev_y, prev_end = None, t_end
                 continue
-            point = (xof(t), bot - int(p * span) - 1)
-            if prev is not None and t - prev[1] <= TIMELINE_GAP:
-                cv2.line(panel, prev[0], point, TRACE,
-                         max(1, int(round(S * 0.7))), cv2.LINE_AA)
-            prev = (point, t)
+            y = bot - int(p * span) - 1
+            xa, xb = bounds(t, t_end)
+            # No riser across a hole: the previous span was cut short by a dropout,
+            # so there is nothing to step from.
+            if prev_y is not None and prev_end is not None \
+                    and t <= prev_end + 1e-9 and prev_y != y:
+                cv2.line(panel, (xa, prev_y), (xa, y), TRACE, thick, cv2.LINE_AA)
+            if xb > xa:
+                cv2.line(panel, (xa, y), (xb, y), TRACE, thick, cv2.LINE_AA)
+            prev_y, prev_end = y, t_end
 
         latest = next((e[1 + pos] for e in reversed(pts)
                        if e[1 + pos] is not None),
