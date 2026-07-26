@@ -13,13 +13,17 @@ and this picks it up within a second, without a restart.
   h  save this frame as a detector test case (press when it says NO FACE)
   t  train a new PIXEL generation from the current dataset
   p  train a new POOLED generation (learned kernels, shift-invariant)
-  g  cycle generation: follow-the-web-UI, then each one in turn
+  g  cycle generation: follow-the-web-UI, then each one in turn (up/down
+     arrows step the same cycle either way)
   b  override the blur (diagnostic, pixel models only - see below)
   q  quit               + -  resize              f  fullscreen
-  SPACE  pause; click the timeline, or step with the arrow keys, to revisit
-         any frame of the last 10 seconds - the capture keys then save THAT
+  SPACE  pause; click the timeline, or step with left/right, to revisit any
+         frame of the last 10 seconds - the capture keys then save THAT
          frame. For grabbing a misdetection after you saw it: a blink is ~one
-         frame, gone before you can press anything live.
+         frame, gone before you can press anything live. Switching models
+         while paused (g, up/down, the web UI, or training) re-scores all
+         frozen frames, so the timeline shows what the new model thinks of
+         the same ten seconds; live, a switch only affects new frames.
 
 Two kinds of model, and `g` is how you compare them. The pixel one reads 960 fixed
 pixels, so the pupil has to be where it was during training; the pooled one
@@ -93,6 +97,8 @@ CAPTURES = {
 # which one arrives depends on the highgui backend the wheel was built with.
 K_LEFT = {65361, 16777234}
 K_RIGHT = {65363, 16777236}
+K_UP = {65362, 16777235}
+K_DOWN = {65364, 16777237}
 
 
 class Verdict:
@@ -194,6 +200,28 @@ class App:
         self.apply_blur()
         self.status = (f"{gen} ({model.accuracy:.1%} held-out)" if model
                        else "no model - capture samples, then press t")
+        if self.paused:
+            self.reeval()
+
+    def reeval(self):
+        """Re-score every stored frame with the current model.
+
+        Only the classification: detection is geometry already stored on each
+        Verdict, and MediaPipe is the expensive half. Runs when the model (or
+        its blur) changes while paused, so the frozen timeline and insets show
+        what the NEW model thinks of the same ten seconds. Live, only frames
+        from here on get the new model - a moving feed already means that.
+        """
+        model = self.model
+        for v in self.history:
+            if v.det and model:
+                v.probs, _crops, v.quads = model.eyes(v.gray, v.det.landmarks,
+                                                      roll=v.det.roll)
+            else:
+                v.probs = v.quads = None
+        if self.history:
+            print(f"  re-scored {len(self.history)} frames with "
+                  f"{self.model_gen if model else 'no model'}")
 
     def apply_blur(self):
         """Push the override, if any, onto the loaded model.
@@ -208,7 +236,7 @@ class App:
         self.model.blur = (self.trained_blur if self.blur_override is None
                            else self.blur_override)
 
-    def cycle_generation(self):
+    def cycle_generation(self, step=1):
         """Step through the generations, and back to following the web UI.
 
         ``None`` is a real option in the cycle, not an absence of one: pinning
@@ -221,7 +249,7 @@ class App:
         options = [None] + self.gens          # None = follow models/active
         current = self.model_gen if self.pinned else None
         i = options.index(current) if current in options else 0
-        chosen = options[(i + 1) % len(options)]
+        chosen = options[(i + step) % len(options)]
         self.trained_blur = None
         self.load_model(chosen)
         if chosen is None:
@@ -241,6 +269,8 @@ class App:
         self.apply_blur()
         print(f"  blur override -> {self.blur_override}"
               f"  (model trained with {self.trained_blur})")
+        if self.paused:
+            self.reeval()
 
     def poll(self):
         """Follow what the web UI does, without needing a channel to it.
@@ -547,6 +577,9 @@ def loop(app, pipe):
 
     while True:
         if app.paused:
+            # Polled here too: a model activated in the web UI mid-pause lands
+            # via load_model, which re-scores the frozen frames.
+            app.poll()
             # ponytail: a static frame redrawn at ~20Hz, so capture feedback and
             # mouse selection show up without dirty-flag bookkeeping.
             target = app.history[app.sel]
@@ -585,8 +618,10 @@ def loop(app, pipe):
         elif key == ord("p"):
             app.status = "training pooled ..."
             app.train("pooled")
-        elif key == ord("g"):
-            app.cycle_generation()
+        elif key == ord("g") or raw in K_UP:
+            app.cycle_generation(+1)
+        elif raw in K_DOWN:
+            app.cycle_generation(-1)
         elif key == ord("b"):
             app.cycle_blur()
         elif key == ord(" "):
