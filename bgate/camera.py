@@ -89,6 +89,22 @@ class IRCamera:
         # rather than wrapping around into spurious highlights.
         return cv2.subtract(g, self.dark)
 
+    def read_pair(self):
+        """One lit frame and its ambient-subtracted twin, or None.
+
+        Both halves of the comparison from the SAME exposure - running the two
+        modes in separate sessions compares different pose and lighting as well
+        as different preprocessing, which is what made the question hard to
+        settle. Requires ``subtract=False``, or the raw half is already
+        subtracted and there is nothing to compare.
+        """
+        g = self.read()
+        if g is None:
+            return None
+        if self.dark is None or time.time() - self._dark_t > self.DARK_MAX_AGE:
+            return g, g         # no fresh reference: identical halves, honest
+        return g, cv2.subtract(g, self.dark)
+
     def release(self):
         self.cap.release()
 

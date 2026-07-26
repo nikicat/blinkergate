@@ -54,6 +54,16 @@ A third lane shows the interval between verdicts in milliseconds, with the measu
 bar under it is a frame the pipeline dropped - which is the difference between "the
 detector lost the face" and "no frame arrived to look at".
 
+``--compare`` answers "is --subtract actually better?" without trusting memory
+across two sessions. Every frame is processed BOTH ways - raw and ambient-
+subtracted, from the one exposure - and the two detections are shown side by
+side, replacing the unannotated camera pane, which showed nothing the annotated
+one does not. All four eye lanes share the single time axis, so a disagreement
+is a place where the lanes differ vertically; the state line greys when the two
+modes agree and goes orange when they do not. It costs a second MediaPipe pass
+per frame, so the verdict rate drops - the frame-time lane shows exactly how
+much. Captures still save the RAW frame, keeping the dataset one distribution.
+
 ``--pattern`` (default ``l,r,r,l``, sides YOURS) is the gesture this project
 exists to detect. Four symbols, freely mixed: ``l``/``r`` are winks, scored as
 the eye shuts; ``long``/``short`` are both-eye closures, scored as the eyes
@@ -120,16 +130,25 @@ class Verdict:
     whatever the camera has produced since.
     """
 
-    __slots__ = ("stamp", "gray", "det", "probs", "quads", "locator", "angle")
+    __slots__ = ("stamp", "gray", "det", "probs", "quads", "locator", "angle",
+                 "alt")
 
     def __init__(self, stamp, gray, det, probs, quads, locator, angle):
         self.stamp, self.gray, self.det = stamp, gray, det
         self.probs, self.quads = probs, quads
         self.locator, self.angle = locator, angle
+        # In --compare, the same exposure processed the other way. The pair is
+        # one history entry so the two can never drift apart by a frame.
+        self.alt = None
 
     def __getitem__(self, i):
-        # A Verdict is its own timeline entry: the strip reads (t, p0, p1).
-        return (self.stamp, *(self.probs or (None, None)))[i]
+        # A Verdict is its own timeline entry: the strip reads (t, p0, p1), and
+        # (t, p0, p1, alt0, alt1) when a comparison is running, which is what
+        # puts both modes' lanes on one shared time axis.
+        probs = self.probs or (None, None)
+        if self.alt is not None:
+            probs = (*probs, *(self.alt.probs or (None, None)))
+        return (self.stamp, *probs)[i]
 
 
 class App:
@@ -164,24 +183,37 @@ class App:
         self.load_model()
 
     def make_processor(self):
-        """A ``process(stamp, gray)`` for one worker thread.
+        """A ``process(stamp, frame)`` for one worker thread.
 
         Called inside the worker, so the locator it builds belongs to that thread
         alone. ``self.model`` is re-read per frame rather than captured, because
         `g` and `t` swap it from the main thread - and a reference read is the one
         thing that is safe to do across threads without ceremony.
+
+        Under --compare the frame is a (lit, ambient-subtracted) pair and each
+        half gets its OWN locator: the roll tracker carries state between calls,
+        so one locator fed both halves alternately would blend them.
         """
         locator = default_locator()
+        alt_locator = default_locator() if self.args.compare else None
 
-        def process(stamp, gray):
-            det = locator.locate(gray)
+        def one(stamp, gray, loc):
+            det = loc.locate(gray)
             probs = quads = None
             model = self.model
             if det and model:
                 probs, _crops, quads = model.eyes(gray, det.landmarks,
                                                   roll=det.roll)
-            return Verdict(stamp, gray, det, probs, quads, locator.used,
-                           getattr(locator, "angle", 0.0))
+            return Verdict(stamp, gray, det, probs, quads, loc.used,
+                           getattr(loc, "angle", 0.0))
+
+        def process(stamp, frame):
+            if alt_locator is None:
+                return one(stamp, frame, locator)
+            lit, sub = frame
+            v = one(stamp, lit, locator)
+            v.alt = one(stamp, sub, alt_locator)
+            return v
         return process
 
     def absorb(self, v):
@@ -227,12 +259,15 @@ class App:
         from here on get the new model - a moving feed already means that.
         """
         model = self.model
-        for v in self.history:
-            if v.det and model:
-                v.probs, _crops, v.quads = model.eyes(v.gray, v.det.landmarks,
-                                                      roll=v.det.roll)
-            else:
-                v.probs = v.quads = None
+        for entry in self.history:
+            for v in (entry, entry.alt):
+                if v is None:
+                    continue
+                if v.det and model:
+                    v.probs, _crops, v.quads = model.eyes(
+                        v.gray, v.det.landmarks, roll=v.det.roll)
+                else:
+                    v.probs = v.quads = None
         if self.history:
             print(f"  re-scored {len(self.history)} frames with "
                   f"{self.model_gen if model else 'no model'}")
@@ -386,13 +421,14 @@ class App:
         # A mismatched blur is not a valid reading, so say so in red.
         return (0, 0, 255) if self.blur_mismatch() else (0, 200, 255)
 
-    def render(self, v, pipe=None):
-        """Draw one verdict. Pure display - the probabilities were computed in a
-        worker and are not recomputed here, so a slow render costs smoothness and
-        nothing else."""
+    def draw_pane(self, v, label):
+        """One verdict as an annotated pane, its eye insets and its state text.
+
+        Split out so --compare can draw the same thing twice, once per
+        preprocessing mode, from the one exposure they share.
+        """
         gray, det = v.gray, v.det
-        raw = cv2.cvtColor(ui.enlarge(gray), cv2.COLOR_GRAY2BGR)
-        annot = raw.copy()
+        annot = cv2.cvtColor(ui.enlarge(gray), cv2.COLOR_GRAY2BGR)
         state = "no face"
         blank = np.zeros((int(ui.INSET_H * ui.S), int(ui.INSET_W * ui.S), 3), np.uint8)
         insets = [blank, blank]
@@ -434,31 +470,53 @@ class App:
         elif not self.model:
             state = "no model - capture samples and press t"
 
+        ui.txt(annot, label, ui.P(8, 22), 0.5, (0, 255, 0), 1.2)
+        return annot, insets, state
+
+    def render(self, v, pipe=None):
+        """Draw one verdict. Pure display - the probabilities were computed in a
+        worker and are not recomputed here, so a slow render costs smoothness and
+        nothing else."""
+        compare = v.alt is not None
+        annot, insets, state = self.draw_pane(v, "RAW" if compare else
+                                              "DETECTION")
+        if compare:
+            # The raw camera pane is dropped, not the detection: the annotated
+            # pane already shows those pixels, so the space buys the second mode.
+            alt_annot, _alt_insets, alt_state = self.draw_pane(
+                v.alt, "AMBIENT-SUBTRACTED")
+            top = np.hstack([annot, alt_annot])
+            agree = state == alt_state
+            state_colour = (150, 150, 150) if agree else (0, 165, 255)
+            state = f"raw {state}   |   sub {alt_state}"
+        else:
+            top = np.hstack([cv2.cvtColor(ui.enlarge(v.gray),
+                                          cv2.COLOR_GRAY2BGR), annot])
+            state_colour = ((0, 165, 255) if state not in ("open", "no face")
+                            else (150, 150, 150))
+
         g = self.gesture
         if self.paused:
             # How far back the shown frame is; the state colour rule reads any
             # non-"open" text as orange, which is right for a frozen view too.
             state = f"PAUSED {v.stamp - self.history[-1][0]:.1f}s  {state}"
+            state_colour = (0, 165, 255)
         elif g.matched_at is not None and v.stamp - g.matched_at < 2.0:
             state = f"GESTURE {','.join(g.pattern)}"
+            state_colour = (60, 220, 60)
         elif g.progress:
             state += f"   gesture {g.progress}/{len(g.pattern)}"
-
-        ui.txt(annot, "DETECTION", ui.P(8, 22), 0.5, (0, 255, 0), 1.2)
-        top = np.hstack([raw, annot])
 
         counts = self.dataset.counts()
         # Laid out to match the picture: your left eye is on the image's right.
         band = ui.inset_row(insets[1], insets[0], top.shape[1], [
-            (state, 0.85,
-             (60, 220, 60) if state.startswith("GESTURE") else
-             (0, 165, 255) if state not in ("open", "no face") else (150, 150, 150)),
+            (state, 0.85, state_colour),
             # This frame's roll, not the tracked one: it is the angle the crops
             # were actually levelled by, and showing the tracker's instead put two
             # different numbers on screen under the same name.
             (f"dataset: {counts[data.OPEN]} open / {counts[data.CLOSED]} closed / "
              f"{counts[data.SKIP]} skip    roll "
-             f"{det.roll if det else self.roll:+.0f}deg"
+             f"{v.det.roll if v.det else self.roll:+.0f}deg"
              + (f"  via {v.locator}" if v.locator else ""),
              0.45, (200, 200, 120)),
             (self.model_line(), 0.42, self.model_colour()),
@@ -479,6 +537,13 @@ class App:
         # apart - drawing the subject's left eye under "YOUR RIGHT" is the
         # standing hazard in this codebase.
         lanes = [(i, tag) for i, (_side, _ring, tag) in enumerate(data.SIDES)][::-1]
+        if compare:
+            # Both modes in ONE strip, on one time axis: a Verdict pair reads as
+            # (t, raw_l, raw_r, sub_l, sub_r), so the subtracted lanes are just
+            # positions 2 and 3. Same rule as ever - the index travels with its
+            # label - and the lanes shrink to fit rather than the strip growing.
+            lanes = ([(p, f"{tag} raw") for p, tag in lanes]
+                     + [(p + 2, f"{tag} sub") for p, tag in lanes])
         # "now" is the newest CAPTURE, not the wall clock: the right edge should be
         # the last thing the camera saw, so a stalled camera freezes the plot
         # instead of scrolling an ever-widening blank off to the right.
@@ -486,7 +551,8 @@ class App:
                             self.history[-1][0] if self.history else v.stamp,
                             self.args.thresh, HISTORY_SECONDS, lanes,
                             captures=pipe.capture.stamps if pipe else None,
-                            cursor=v.stamp if self.paused else None)
+                            cursor=v.stamp if self.paused else None,
+                            lane_height=ui.LANE_H_COMPACT if compare else None)
         return np.vstack([top, band, strip])
 
 
@@ -513,6 +579,9 @@ def main():
                          "both-eye closures (e.g. l,r,r,l or long,long,short)")
     ap.add_argument("--subtract", action="store_true",
                     help="subtract the unlit strobe frame to cancel ambient IR")
+    ap.add_argument("--compare", action="store_true",
+                    help="process every frame BOTH ways, raw and ambient-"
+                         "subtracted, side by side on one time axis")
     ap.add_argument("--workers", type=int, default=1,
                     help="processing threads. More than one overlaps MediaPipe's "
                          "inference but completes out of order")
@@ -521,16 +590,22 @@ def main():
                          "always the freshest, never one in hand)")
     args = ap.parse_args()
     ui.S = args.scale
+    if args.compare and args.subtract:
+        sys.exit("--compare already shows both modes; drop --subtract")
 
     app = App(args)
     try:
+        # In compare mode the camera stays raw and the subtraction is done per
+        # frame, so both halves come from the one exposure.
         cam = IRCamera(args.device, subtract=args.subtract)
     except RuntimeError as exc:
         sys.exit(str(exc))
 
     counts = app.dataset.counts()
     print(f"strobe cutoff {cam.lit_cutoff:.1f}   dataset {sum(counts.values())} samples"
-          + ("   ambient subtraction ON" if args.subtract else ""))
+          + ("   ambient subtraction ON" if args.subtract else "")
+          + ("   COMPARING raw vs subtracted (two passes per frame)"
+             if args.compare else ""))
     print(f"{app.status}\nlabel and manage generations at:  uv run serve.py\n")
 
     # Capture runs in its own thread so waiting for the camera and processing a
@@ -539,7 +614,7 @@ def main():
     # the queue absorbs that, so the verdict interval is the processing time
     # instead of the next multiple of 133ms.
     pipe = Pipeline(cam, app.make_processor, workers=args.workers,
-                    frame_depth=args.queue).start()
+                    frame_depth=args.queue, pair=args.compare).start()
 
     cv2.namedWindow(WIN, cv2.WINDOW_NORMAL)
     cv2.resizeWindow(WIN, int(WIN_W * ui.S), int(WIN_H * ui.S))

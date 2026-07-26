@@ -116,16 +116,18 @@ class CaptureLoop(_Loop):
     here, cheaply, and never reaches a worker.
     """
 
-    def __init__(self, camera, out, name="capture"):
+    def __init__(self, camera, out, name="capture", pair=False):
         super().__init__(name)
         self.camera = camera
         self.out = out
+        self.pair = pair                    # enqueue (lit, ambient-subtracted)
         self.paused = False                 # set from the UI thread; a plain bool
         self.stamps = deque(maxlen=512)     # every lit frame we captured
 
     def work(self):
         while not self._stop.is_set():
-            gray = self.camera.read()
+            gray = (self.camera.read_pair() if self.pair
+                    else self.camera.read())
             if gray is None:                # unlit, or a failed read; the camera
                 continue                    # counts those two separately
             if self.paused:
@@ -185,10 +187,10 @@ class Pipeline:
     """
 
     def __init__(self, camera, make_process, workers=1, frame_depth=2,
-                 result_depth=2):
+                 result_depth=2, pair=False):
         self.frames = DropQueue("frames", frame_depth)
         self.results = DropQueue("results", result_depth)
-        self.capture = CaptureLoop(camera, self.frames)
+        self.capture = CaptureLoop(camera, self.frames, pair=pair)
         self.workers = [WorkerLoop(self.frames, self.results, make_process,
                                    name=f"worker{i}")
                         for i in range(max(1, int(workers)))]

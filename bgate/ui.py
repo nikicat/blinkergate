@@ -155,6 +155,7 @@ def eye_inset(gray, m, lm, ring, quad, title, p_open, shut, extra=None):
 
 # Timeline geometry, in design pixels.
 LANE_H = 54                 # one eye's lane
+LANE_H_COMPACT = 36         # four lanes (two modes compared) in the same strip
 TIMELINE_HEAD = 17          # the row of second markers above them
 TIMELINE_GUTTER = 84        # left margin, for the lane labels
 # A dropout longer than this is drawn as a hole rather than painted across. At
@@ -251,7 +252,7 @@ def axis_now(pts, fallback=0.0):
 
 
 def timeline(width, history, now, thresh, window, lanes, frame_time=True,
-             captures=None, cursor=None):
+             captures=None, cursor=None, lane_height=None):
     """Time-synced lanes of P(open), most recent at the right edge.
 
     ``history`` is an iterable of ``(t, p0, p1)`` with ``None`` for a frame where
@@ -279,7 +280,7 @@ def timeline(width, history, now, thresh, window, lanes, frame_time=True,
     ``cursor`` is the stamp of the frame selected while paused, highlighted as a
     bar over that frame's whole span.
     """
-    lane_h = int(LANE_H * S)
+    lane_h = int((lane_height or LANE_H) * S)
     head_h = int(TIMELINE_HEAD * S)
     frame_h = int(FRAME_LANE_H * S) if frame_time else 0
     panel = np.full((head_h + len(lanes) * lane_h + frame_h, width, 3), 18,
