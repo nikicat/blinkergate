@@ -459,8 +459,43 @@ def main():
 
     cv2.namedWindow(WIN, cv2.WINDOW_NORMAL)
     cv2.resizeWindow(WIN, int(WIN_W * ui.S), int(WIN_H * ui.S))
+    try:
+        loop(app, pipe)
+    except KeyboardInterrupt:
+        # A stack trace for a deliberate Ctrl-C is noise. The newline is so the
+        # shell prompt does not land on top of the "^C".
+        print("\ninterrupted")
+    finally:
+        # Threads first, then the device: releasing the camera under a capture loop
+        # still reading from it is how you get a segfault on the way out. In a
+        # finally so that Ctrl-C, a closed window and a crash all clean up alike.
+        pipe.stop()
+        for name, err in pipe.errors():
+            print(f"  {name} thread ended with: {err!r}")
+        cam.release()
+        cv2.destroyAllWindows()
+
+
+def window_gone():
+    """Has the user closed the window?
+
+    cv2.imshow *recreates* a window that has been closed, so without this the
+    window reappeared and the app ran on forever. Some builds raise instead of
+    reporting a missing window, which counts the same.
+    """
+    try:
+        return cv2.getWindowProperty(WIN, cv2.WND_PROP_VISIBLE) < 1
+    except cv2.error:
+        return True
+
+
+def loop(app, pipe):
     fullscreen = False
     latest = None
+    # Only a window that has *been* visible can have been closed. Backends differ
+    # on what they report between namedWindow and the first imshow, and reading
+    # that as a close would have quit before drawing anything.
+    was_visible = False
 
     while True:
         item = pipe.results.get(0.05)
@@ -476,8 +511,14 @@ def main():
                 sys.exit(f"{name} thread died: {err!r}")
 
         key = cv2.waitKey(1) & 0xFF
+        if window_gone():
+            if was_visible:
+                return
+        else:
+            was_visible = True
+
         if key == ord("q"):
-            break
+            return
         elif key == ord("t"):
             app.status = "training ..."
             app.train("pixel")
@@ -505,14 +546,6 @@ def main():
             cv2.setWindowProperty(WIN, cv2.WND_PROP_FULLSCREEN,
                                   cv2.WINDOW_FULLSCREEN if fullscreen else
                                   cv2.WINDOW_NORMAL)
-
-    # Threads first, then the device: releasing the camera under a capture loop
-    # still reading from it is how you get a segfault on the way out.
-    pipe.stop()
-    for name, err in pipe.errors():
-        print(f"  {name} thread ended with: {err!r}")
-    cam.release()
-    cv2.destroyAllWindows()
 
 
 if __name__ == "__main__":
