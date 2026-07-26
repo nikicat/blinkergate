@@ -83,6 +83,11 @@ Each press records a 2-second burst. Sides are sides of the **image**: the feed
 is not mirrored, so your left eye appears on the image's right. Aim for 30+
 bursts spread across distances and head angles.
 
+Along the bottom, two time-synced lanes show the last 10 seconds of P(open) per
+eye — green where open, red where shut, and a hole where nothing could be
+classified. Plotted against time rather than frame number, so a one-frame blink
+reads as narrower than a held closure instead of the same width.
+
 ### Label — `serve.py`
 
 Every sample as a thumbnail, bordered by its label and flagged where the model

@@ -32,13 +32,20 @@ when it disagrees with what that model was trained with; it is there to show wha
 the mismatch looks like, not to be run in. A pooled model has no blur.
 
 Sides are YOURS. The feed is not mirrored, so your left eye appears on the RIGHT
-of the picture - the insets are laid out to match the picture, so the one on the
-right of the strip is the one on the right of the frame.
+of the picture - the insets and the timeline lanes are laid out to match the
+picture, so the one on the right of the strip is the one on the right of the frame.
+
+The timeline at the bottom is the last 10 seconds of P(open) per eye, plotted
+against *time* rather than against frame number. That matters here: the sensor
+gives ~7.5 usable frames a second and drops them unevenly, so on an index axis a
+one-frame blink and a four-frame hold are the same width. A frame where nothing
+could be classified is drawn as a hole, because a lost face is not an open eye.
 """
 
 import argparse
 import sys
 import time
+from collections import deque
 
 from bgate import qtfix  # noqa: F401  - must be imported before cv2
 
@@ -53,6 +60,10 @@ from bgate.registry import Registry, train_and_register
 
 WIN = "blinkergate"
 POLL_EVERY = 1.0              # seconds between checks for a generation switch
+HISTORY_SECONDS = 10.0        # how far back the timeline reaches
+# Design pixels. Tall enough for the two frames, the inset band and the
+# timeline stacked - the timeline pushed the content past the old 600.
+WIN_W, WIN_H = 1280, 690
 CAPTURES = {
     ord("o"): ("both OPEN", data.OPEN, data.OPEN),
     ord("c"): ("both CLOSED", data.CLOSED, data.CLOSED),
@@ -80,8 +91,20 @@ class App:
         self.locator_used = None
         self.pinned = False          # generation chosen here, not in the web UI
         self.blur_override = None    # None = whatever the model was trained with
+        # (t, P(open) left, P(open) right), one entry per frame, None where there
+        # was nothing to classify. Timestamped rather than merely ordered: the
+        # timeline plots against time, and monotonic() because this is an elapsed
+        # interval and must not move if the wall clock does.
+        self.history = deque()
         self.gens = self.registry.ids()
         self.load_model()
+
+    def record(self, p_left, p_right):
+        now = time.monotonic()
+        self.history.append((now, p_left, p_right))
+        while self.history and self.history[0][0] < now - HISTORY_SECONDS:
+            self.history.popleft()
+        return now
 
     def load_model(self, gen=None):
         if gen is None:
@@ -284,8 +307,13 @@ class App:
             state = ("BOTH SHUT" if all(shut) else
                      "YOUR LEFT shut" if shut[0] else
                      "YOUR RIGHT shut" if shut[1] else "open")
-        elif not self.model:
-            state = "no model - capture samples and press t"
+            now = self.record(*probs)
+        else:
+            # Recorded even with nothing to classify, so the timeline shows the
+            # dropout instead of closing over it.
+            now = self.record(None, None)
+            if not self.model:
+                state = "no model - capture samples and press t"
 
         ui.txt(annot, "DETECTION", ui.P(8, 22), 0.5, (0, 255, 0), 1.2)
         top = np.hstack([raw, annot])
@@ -312,7 +340,14 @@ class App:
             ("h hard case   t train pixel   p train pooled   g cycle generation"
              "   b blur   q quit", 0.38, (150, 150, 150)),
         ])
-        return np.vstack([top, band])
+        # Reversed to match the insets above, which match the picture. The index
+        # into the history travels with its label so the two cannot be reordered
+        # apart - drawing the subject's left eye under "YOUR RIGHT" is the
+        # standing hazard in this codebase.
+        lanes = [(i, tag) for i, (_side, _ring, tag) in enumerate(data.SIDES)][::-1]
+        strip = ui.timeline(top.shape[1], self.history, now, self.args.thresh,
+                            HISTORY_SECONDS, lanes)
+        return np.vstack([top, band, strip])
 
 
 def main():
@@ -351,7 +386,7 @@ def main():
     print(f"{app.status}\nlabel and manage generations at:  uv run serve.py\n")
 
     cv2.namedWindow(WIN, cv2.WINDOW_NORMAL)
-    cv2.resizeWindow(WIN, int(1280 * ui.S), int(600 * ui.S))
+    cv2.resizeWindow(WIN, int(WIN_W * ui.S), int(WIN_H * ui.S))
     fullscreen = False
 
     while True:
@@ -387,10 +422,10 @@ def main():
             app.capture(gray, det, *CAPTURES[key])
         elif key in (ord("+"), ord("=")):
             ui.S = min(ui.S + 0.25, 4.0)
-            cv2.resizeWindow(WIN, int(1280 * ui.S), int(600 * ui.S))
+            cv2.resizeWindow(WIN, int(WIN_W * ui.S), int(WIN_H * ui.S))
         elif key == ord("-"):
             ui.S = max(ui.S - 0.25, 0.75)
-            cv2.resizeWindow(WIN, int(1280 * ui.S), int(600 * ui.S))
+            cv2.resizeWindow(WIN, int(WIN_W * ui.S), int(WIN_H * ui.S))
         elif key == ord("f"):
             fullscreen = not fullscreen
             cv2.setWindowProperty(WIN, cv2.WND_PROP_FULLSCREEN,

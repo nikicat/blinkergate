@@ -36,6 +36,14 @@ def txt(img, s, org, size, color, thick=1.0):
                 max(1, int(round(thick * S * 0.6))), cv2.LINE_AA)
 
 
+def text_width(s, size, thick=1.0):
+    """Rendered width in pixels, for fitting a label into a known space rather
+    than guessing and having it clipped."""
+    (w, _h), _base = cv2.getTextSize(s, cv2.FONT_HERSHEY_SIMPLEX, size * S,
+                                     max(1, int(round(thick * S * 0.6))))
+    return w
+
+
 def enlarge(gray):
     """IR frame at UI scale, nearest-neighbour so the real pixel grid stays visible."""
     return cv2.resize(gray, None, fx=S, fy=S, interpolation=cv2.INTER_NEAREST)
@@ -143,6 +151,111 @@ def eye_inset(gray, m, lm, ring, quad, title, p_open, shut, extra=None):
     txt(view, f"crop {src_w}px wide  ->  {out_w // max(src_w, 1)}x",
         P(6, INSET_H - 10), 0.42, (185, 185, 185))
     return view
+
+
+# Timeline geometry, in design pixels.
+LANE_H = 54                 # one eye's lane
+TIMELINE_HEAD = 17          # the row of second markers above them
+TIMELINE_GUTTER = 84        # left margin, for the lane labels
+# A dropout longer than this is drawn as a hole rather than painted across. At
+# ~7.5 usable frames a second the normal gap is 0.13s, so this is three missed
+# frames - long enough to be a real loss, short enough not to smear one.
+TIMELINE_GAP = 0.4
+
+OPEN_BG = (28, 74, 36)      # BGR, muted so the trace reads on top of it
+SHUT_BG = (38, 30, 98)
+NODATA_BG = (34, 34, 38)
+TRACE = (232, 232, 232)
+
+
+def timeline(width, history, now, thresh, window, lanes):
+    """Time-synced lanes of P(open), most recent at the right edge.
+
+    ``history`` is an iterable of ``(t, p0, p1)`` with ``None`` for a frame where
+    there was nothing to classify. ``lanes`` is ``[(position, tag), ...]`` in the
+    order to draw them, where position indexes the probabilities in an entry.
+
+    The position and the tag travel together on purpose. The lanes are laid out to
+    match the picture, so the *display* order is the reverse of the dataset's, and
+    passing only the labels reversed would have drawn the subject's left eye under
+    the words "YOUR RIGHT". Every left/right bug in this project has come from a
+    name and an index being reordered separately.
+
+    Plotted against **time, not sample index**. The sensor delivers ~7.5 usable
+    frames a second and drops them unevenly, so equal-width samples would stretch
+    and squash the exact durations this exists to show: a natural blink is ~150 ms,
+    about one frame. Against an index axis a one-frame blink and a four-frame hold
+    look the same width.
+
+    A gap in detection is drawn as a gap. A frame with no face is not an open eye,
+    and painting it green would invent the one reading that matters most.
+    """
+    lane_h = int(LANE_H * S)
+    head_h = int(TIMELINE_HEAD * S)
+    panel = np.full((head_h + len(lanes) * lane_h, width, 3), 18, np.uint8)
+    x0, x1 = int(TIMELINE_GUTTER * S), width - int(10 * S)
+    plot_w = max(x1 - x0, 1)
+    pts = list(history)
+
+    def xof(t):
+        frac = 1.0 - (now - t) / window
+        return int(round(x0 + min(max(frac, 0.0), 1.0) * plot_w))
+
+    # Second markers, so a stripe's width can be read as a duration.
+    for s in range(int(window), -1, -1):
+        x = xof(now - s)
+        cv2.line(panel, (x, head_h), (x, panel.shape[0]), (44, 44, 48), 1)
+        if s % 2 == 0:
+            label = f"-{s}s" if s else "now"
+            # Clamped, not offset blindly: the "now" tick sits at the right edge
+            # and its label ran off it.
+            lx = min(x + int(2 * S), width - text_width(label, 0.32) - int(3 * S))
+            txt(panel, label, (lx, int(12 * S)), 0.32, (120, 120, 128))
+
+    for i, (pos, tag) in enumerate(lanes):
+        top = head_h + i * lane_h
+        bot = top + lane_h - int(3 * S)
+        span = bot - top - 2
+        panel[top:bot, x0:x1] = NODATA_BG
+
+        # Piecewise-constant background: each sample holds until the next one, or
+        # until now for the newest. That is what a discrete sample means.
+        for j, entry in enumerate(pts):
+            t, p = entry[0], entry[1 + pos]
+            t_end = pts[j + 1][0] if j + 1 < len(pts) else now
+            t_end = min(t_end, t + TIMELINE_GAP)
+            xa, xb = xof(t), max(xof(t_end), xof(t) + 1)
+            xa, xb = max(xa, x0), min(xb, x1)
+            if xb > xa:
+                panel[top:bot, xa:xb] = (
+                    NODATA_BG if p is None else
+                    SHUT_BG if p < thresh else OPEN_BG)
+
+        cv2.line(panel, (x0, bot - int(thresh * span) - 1),
+                 (x1, bot - int(thresh * span) - 1), (110, 110, 120), 1)
+
+        prev = None
+        for entry in pts:
+            t, p = entry[0], entry[1 + pos]
+            if p is None:
+                prev = None
+                continue
+            point = (xof(t), bot - int(p * span) - 1)
+            if prev is not None and t - prev[1] <= TIMELINE_GAP:
+                cv2.line(panel, prev[0], point, TRACE,
+                         max(1, int(round(S * 0.7))), cv2.LINE_AA)
+            prev = (point, t)
+
+        latest = next((e[1 + pos] for e in reversed(pts)
+                       if e[1 + pos] is not None),
+                      None)
+        shut = latest is not None and latest < thresh
+        colour = (0, 0, 255) if shut else (0, 255, 0) if latest is not None \
+            else (130, 130, 130)
+        txt(panel, tag, (int(6 * S), top + int(20 * S)), 0.36, colour, 1.2)
+        txt(panel, "-" if latest is None else f"{latest:.2f}",
+            (int(6 * S), top + int(40 * S)), 0.38, colour, 1.2)
+    return panel
 
 
 def inset_row(left_in, right_in, width, lines):
