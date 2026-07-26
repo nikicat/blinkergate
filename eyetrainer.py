@@ -54,6 +54,12 @@ A third lane shows the interval between verdicts in milliseconds, with the measu
 bar under it is a frame the pipeline dropped - which is the difference between "the
 detector lost the face" and "no frame arrived to look at".
 
+``--pattern`` (default ``l,r,r,l``, sides YOURS) is the wink sequence this project
+exists to detect: winks from open eyes only, both-shut resets the attempt - a
+natural blink is both-eyed - and the whole sequence must land within six seconds.
+The header counts winks as they land and flashes GESTURE on a match; nothing is
+gated on it yet, this is where the gesture gets practised against a live model.
+
 Capture runs in its own thread, feeding a short queue that discards its oldest
 frame when full. Serially, a pass over 133ms missed the next lit frame outright and
 the next usable one came 266ms later, so the cost of being slightly slow was
@@ -78,6 +84,7 @@ from bgate import data, ui
 from bgate.camera import IRCamera, DEFAULT_DEVICE
 from bgate.data import Dataset
 from bgate.detect import default_locator
+from bgate.gesture import GestureMatcher
 from bgate.pipeline import Pipeline
 from bgate.registry import Registry, train_and_register
 
@@ -148,6 +155,7 @@ class App:
         self.history = deque()
         self.paused = False
         self.sel = 0                 # index into history while paused
+        self.gesture = GestureMatcher(args.pattern, thresh=args.thresh)
         self.gens = self.registry.ids()
         self.load_model()
 
@@ -184,6 +192,8 @@ class App:
         cutoff = v.stamp - HISTORY_SECONDS
         while self.history and self.history[0][0] < cutoff:
             self.history.popleft()
+        if self.gesture.feed(v.stamp, v.probs):
+            print(f"  GESTURE {','.join(self.gesture.pattern)}")
         if v.det:
             self.roll = v.angle
             self.locator_used = v.locator
@@ -420,10 +430,15 @@ class App:
         elif not self.model:
             state = "no model - capture samples and press t"
 
+        g = self.gesture
         if self.paused:
             # How far back the shown frame is; the state colour rule reads any
             # non-"open" text as orange, which is right for a frozen view too.
             state = f"PAUSED {v.stamp - self.history[-1][0]:.1f}s  {state}"
+        elif g.matched_at is not None and v.stamp - g.matched_at < 2.0:
+            state = f"GESTURE {','.join(g.pattern)}"
+        elif g.progress:
+            state += f"   wink {g.progress}/{len(g.pattern)}"
 
         ui.txt(annot, "DETECTION", ui.P(8, 22), 0.5, (0, 255, 0), 1.2)
         top = np.hstack([raw, annot])
@@ -432,6 +447,7 @@ class App:
         # Laid out to match the picture: your left eye is on the image's right.
         band = ui.inset_row(insets[1], insets[0], top.shape[1], [
             (state, 0.85,
+             (60, 220, 60) if state.startswith("GESTURE") else
              (0, 165, 255) if state not in ("open", "no face") else (150, 150, 150)),
             # This frame's roll, not the tracked one: it is the angle the crops
             # were actually levelled by, and showing the tracker's instead put two
@@ -470,6 +486,15 @@ class App:
         return np.vstack([top, band, strip])
 
 
+def pattern_arg(text):
+    pat = [s.strip().lower() for s in text.split(",") if s.strip()]
+    try:
+        GestureMatcher(pat)
+    except ValueError as exc:
+        raise argparse.ArgumentTypeError(str(exc))
+    return pat
+
+
 def main():
     ap = argparse.ArgumentParser(
         description="blinkergate live view: detection and labelled capture.")
@@ -479,6 +504,8 @@ def main():
     ap.add_argument("--scale", type=float, default=2.0, help="UI scale")
     ap.add_argument("--thresh", type=float, default=0.5,
                     help="P(open) below this counts as shut")
+    ap.add_argument("--pattern", type=pattern_arg, default=["l", "r", "r", "l"],
+                    help="wink sequence to match, YOUR left/right (l,r,r,l)")
     ap.add_argument("--subtract", action="store_true",
                     help="subtract the unlit strobe frame to cancel ambient IR")
     ap.add_argument("--workers", type=int, default=1,
