@@ -62,7 +62,11 @@ one does not. All four eye lanes share the single time axis, so a disagreement
 is a place where the lanes differ vertically; the state line greys when the two
 modes agree and goes orange when they do not. It costs a second MediaPipe pass
 per frame, so the verdict rate drops - the frame-time lane shows exactly how
-much. Captures still save the RAW frame, keeping the dataset one distribution.
+much. A capture saves BOTH halves under one stamp - same exposure, so the
+labels are equally true of each - with the index recording which is which:
+0 raw, 1 subtracted. Nothing is lost by mixing them; the dataset already spans
+a 3.5x range of ambient brightness, which moves a frame further than
+subtraction does, and per-crop standardisation is there for exactly that.
 
 ``--pattern`` (default ``l,r,r,l``, sides YOURS) is the gesture this project
 exists to detect. Four symbols, freely mixed: ``l``/``r`` are winks, scored as
@@ -352,33 +356,53 @@ class App:
             self.load_model()
             print(f"  switched to {self.model_gen}")
 
-    def capture(self, gray, det, name, label_left, label_right):
+    def capture(self, v, name, label_left, label_right):
         """One frame, now. Holding a pose for a burst produced ~15 near-identical
         frames worth about one frame of information (measured: training on 1 per
         press scored 88.1% against 86.5% for all 15), so a press takes exactly
-        the frame you pressed on."""
-        if not det:
+        the frame you pressed on.
+
+        Under --compare that frame has two halves, and BOTH are saved under the
+        one stamp: it is a single exposure, so the labels are equally true of
+        each, and the index says which preprocessing it was - 0 raw, 1 ambient-
+        subtracted. Each half is cropped by its OWN detection, since the two
+        detectors ran separately and need not agree. A half that found no face
+        is skipped rather than saved landmark-less, which would put a sample in
+        the CSV with no crop behind it.
+        """
+        halves = [(i, h) for i, h in enumerate((v, v.alt))
+                  if h is not None and h.det]
+        if not halves:
             self.status = f"{name}: no face - nothing captured"
             return
         stamp = int(time.time() * 1000)
-        self.dataset.add_capture(gray, label_left, label_right, stamp,
-                                 lm=det.landmarks)
-        self.captured += 1
+        for index, h in halves:
+            self.dataset.add_capture(h.gray, label_left, label_right, stamp,
+                                     index=index, lm=h.det.landmarks)
+        self.captured += len(halves)
         counts = self.dataset.counts()
-        self.status = (f"captured {name}  ({self.captured} this session, "
+        both = "  (raw + subtracted)" if len(halves) > 1 else ""
+        self.status = (f"captured {name}{both}  ({self.captured} this session, "
                        f"{counts[data.OPEN]}/{counts[data.CLOSED]} open/closed)")
         print(f"  {self.status}")
 
-    def capture_hard(self, gray, det):
+    def capture_hard(self, v):
         """Record a frame the detector should have handled.
 
         Captures whether or not a face was found - the failures are the whole
-        point, and the ordinary capture path refuses exactly those.
+        point, and the ordinary capture path refuses exactly those. Under
+        --compare both halves are recorded with their own verdict, so "raw lost
+        the face, subtraction held it" is written down as the two rows that say
+        exactly that rather than being lost to whichever half was primary.
         """
-        frame = self.dataset.add_detector_case(gray, bool(det))
-        self.hard += 1
-        found = "found" if det else "NO FACE"
-        self.status = f"detector case {self.hard} saved ({found}): {frame}"
+        saved = []
+        for h, note in ((v, "raw"), (v.alt, "subtracted")):
+            if h is None:
+                continue
+            self.dataset.add_detector_case(h.gray, bool(h.det), note=note)
+            saved.append(f"{note} {'found' if h.det else 'NO FACE'}")
+        self.hard += len(saved)
+        self.status = f"detector case {self.hard}: " + ", ".join(saved)
         print(f"  {self.status}")
 
     def train(self, kind="pixel"):
@@ -774,9 +798,9 @@ def loop(app, pipe):
         elif target is None:
             pass            # the keys below all act on a frame; there is none yet
         elif key == ord("h"):
-            app.capture_hard(target.gray, target.det)
+            app.capture_hard(target)
         elif key in CAPTURES:
-            app.capture(target.gray, target.det, *CAPTURES[key])
+            app.capture(target, *CAPTURES[key])
         elif key in (ord("+"), ord("=")):
             ui.S = min(ui.S + 0.25, 4.0)     # the window follows on next render
         elif key == ord("-"):
