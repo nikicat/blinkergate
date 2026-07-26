@@ -40,6 +40,11 @@ against *time* rather than against frame number. That matters here: the sensor
 gives ~7.5 usable frames a second and drops them unevenly, so on an index axis a
 one-frame blink and a four-frame hold are the same width. A frame where nothing
 could be classified is drawn as a hole, because a lost face is not an open eye.
+
+A third lane shows the interval between frames in milliseconds, with the measured
+66ms and 133ms marked. It shares the same time axis, so a camera stall lines up
+with whatever the eyes were doing during it - which is the difference between "the
+detector lost the face" and "no frame arrived to look at".
 """
 
 import argparse
@@ -62,8 +67,8 @@ WIN = "blinkergate"
 POLL_EVERY = 1.0              # seconds between checks for a generation switch
 HISTORY_SECONDS = 10.0        # how far back the timeline reaches
 # Design pixels. Tall enough for the two frames, the inset band and the
-# timeline stacked - the timeline pushed the content past the old 600.
-WIN_W, WIN_H = 1280, 690
+# timeline and its frame-time lane stacked - they pushed the content past 600.
+WIN_W, WIN_H = 1280, 740
 CAPTURES = {
     ord("o"): ("both OPEN", data.OPEN, data.OPEN),
     ord("c"): ("both CLOSED", data.CLOSED, data.CLOSED),

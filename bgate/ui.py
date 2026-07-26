@@ -167,8 +167,52 @@ SHUT_BG = (38, 30, 98)
 NODATA_BG = (34, 34, 38)
 TRACE = (232, 232, 232)
 
+# Frame-time lane. Milliseconds rather than frames per second: this hardware is
+# described in ms throughout - 66 for the raw camera, ~133 once unlit strobe
+# frames are dropped, ~150 for a natural blink - and a dropped frame reads as a
+# clear spike to 266ms where on an fps axis it collapses towards zero.
+FRAME_LANE_H = 46
+FRAME_MS_MAX = 300.0        # top of the scale
+FRAME_REFS = (66, 133)      # measured: camera interval, and after the strobe drop
+FRAME_BAR = (150, 116, 60)
+FRAME_OVER = (60, 150, 220)     # off the top of the scale, so it cannot be read
+FRAME_BG = (30, 30, 34)
 
-def timeline(width, history, now, thresh, window, lanes):
+
+def _frame_lane(panel, top, bot, x0, x1, xof, pts):
+    """Frame interval as bars, one per gap between consecutive samples.
+
+    A bar spans exactly the interval it measures, so it lines up with whatever
+    the eye lanes were doing while the camera took that long. Nothing extra is
+    stored for this: the intervals are the differences between the timestamps the
+    lanes are already plotted against, which is also why it cannot drift out of
+    sync with them.
+    """
+    span = bot - top - 2
+    panel[top:bot, x0:x1] = FRAME_BG
+
+    for a, b in zip(pts, pts[1:]):
+        ms = (b[0] - a[0]) * 1000.0
+        xa = max(xof(a[0]), x0)
+        xb = min(max(xof(b[0]), xof(a[0]) + 1), x1)
+        if xb <= xa:
+            continue
+        h = max(int(min(ms / FRAME_MS_MAX, 1.0) * span), 1)
+        panel[bot - h - 1:bot - 1, xa:xb] = (
+            FRAME_OVER if ms > FRAME_MS_MAX else FRAME_BAR)
+
+    # After the bars, not before: at the normal 133ms the bars are taller than the
+    # 66ms line and were hiding it, which left the lane with one reference instead
+    # of two.
+    for ref in FRAME_REFS:
+        y = bot - int(min(ref / FRAME_MS_MAX, 1.0) * span) - 1
+        cv2.line(panel, (x0, y), (x1, y), (210, 210, 216), 1)
+        label = f"{ref}ms"
+        txt(panel, label, (x1 - text_width(label, 0.26) - int(4 * S),
+                           y - int(3 * S)), 0.26, (215, 215, 220))
+
+
+def timeline(width, history, now, thresh, window, lanes, frame_time=True):
     """Time-synced lanes of P(open), most recent at the right edge.
 
     ``history`` is an iterable of ``(t, p0, p1)`` with ``None`` for a frame where
@@ -189,10 +233,15 @@ def timeline(width, history, now, thresh, window, lanes):
 
     A gap in detection is drawn as a gap. A frame with no face is not an open eye,
     and painting it green would invent the one reading that matters most.
+
+    ``frame_time`` adds a third lane of the interval between frames, sharing the
+    same x mapping so a stall lines up with whatever the eyes were doing during it.
     """
     lane_h = int(LANE_H * S)
     head_h = int(TIMELINE_HEAD * S)
-    panel = np.full((head_h + len(lanes) * lane_h, width, 3), 18, np.uint8)
+    frame_h = int(FRAME_LANE_H * S) if frame_time else 0
+    panel = np.full((head_h + len(lanes) * lane_h + frame_h, width, 3), 18,
+                    np.uint8)
     x0, x1 = int(TIMELINE_GUTTER * S), width - int(10 * S)
     plot_w = max(x1 - x0, 1)
     pts = list(history)
@@ -200,17 +249,6 @@ def timeline(width, history, now, thresh, window, lanes):
     def xof(t):
         frac = 1.0 - (now - t) / window
         return int(round(x0 + min(max(frac, 0.0), 1.0) * plot_w))
-
-    # Second markers, so a stripe's width can be read as a duration.
-    for s in range(int(window), -1, -1):
-        x = xof(now - s)
-        cv2.line(panel, (x, head_h), (x, panel.shape[0]), (44, 44, 48), 1)
-        if s % 2 == 0:
-            label = f"-{s}s" if s else "now"
-            # Clamped, not offset blindly: the "now" tick sits at the right edge
-            # and its label ran off it.
-            lx = min(x + int(2 * S), width - text_width(label, 0.32) - int(3 * S))
-            txt(panel, label, (lx, int(12 * S)), 0.32, (120, 120, 128))
 
     for i, (pos, tag) in enumerate(lanes):
         top = head_h + i * lane_h
@@ -255,6 +293,31 @@ def timeline(width, history, now, thresh, window, lanes):
         txt(panel, tag, (int(6 * S), top + int(20 * S)), 0.36, colour, 1.2)
         txt(panel, "-" if latest is None else f"{latest:.2f}",
             (int(6 * S), top + int(40 * S)), 0.38, colour, 1.2)
+
+    if frame_time:
+        top = head_h + len(lanes) * lane_h
+        _frame_lane(panel, top, top + frame_h - int(3 * S), x0, x1, xof, pts)
+        gaps = sorted((b[0] - a[0]) * 1000.0 for a, b in zip(pts, pts[1:]))
+        # The median, not the newest: one interval is noise, and the median is
+        # what the frame budget actually is.
+        mid = gaps[len(gaps) // 2] if gaps else None
+        txt(panel, "FRAME TIME", (int(6 * S), top + int(17 * S)), 0.34,
+            (150, 150, 160), 1.2)
+        txt(panel, "-" if mid is None else f"{mid:.0f}ms {1000 / mid:.1f}/s",
+            (int(6 * S), top + int(36 * S)), 0.34,
+            (150, 150, 160) if mid else (110, 110, 118), 1.2)
+
+    # Second markers last, so they cross every lane and the three read as one
+    # time axis rather than three graphs that happen to be stacked.
+    for s in range(int(window), -1, -1):
+        x = xof(now - s)
+        cv2.line(panel, (x, head_h), (x, panel.shape[0]), (86, 86, 94), 1)
+        if s % 2 == 0:
+            label = f"-{s}s" if s else "now"
+            # Clamped, not offset blindly: the "now" tick sits at the right edge
+            # and its label ran off it.
+            lx = min(x + int(2 * S), width - text_width(label, 0.32) - int(3 * S))
+            txt(panel, label, (lx, int(12 * S)), 0.32, (120, 120, 128))
     return panel
 
 
