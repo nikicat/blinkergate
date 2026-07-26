@@ -76,12 +76,15 @@ Hold the pose and press:
 |---|---|
 | `o` | both eyes open |
 | `c` | both eyes closed |
-| `1` | image-left eye shut |
-| `2` | image-right eye shut |
+| `l` | YOUR LEFT eye shut |
+| `r` | YOUR RIGHT eye shut |
 
-Each press records a 2-second burst. Sides are sides of the **image**: the feed
-is not mirrored, so your left eye appears on the image's right. Aim for 30+
-bursts spread across distances and head angles.
+Each press records exactly the frame you pressed on: a held pose gave ~15
+near-identical frames worth about one frame of information, and training on one
+per press scored 88.1% against 86.5% for all 15. Sides are **yours**, not the
+image's — the feed is not mirrored, so your left eye appears on the image's
+right, and the insets and timeline lanes are laid out to match the picture. Aim
+for 30+ captures spread across distances and head angles.
 
 Along the bottom, three time-synced lanes show the last 10 seconds: P(open) per
 eye — green where open, red where shut, and a hole where nothing could be

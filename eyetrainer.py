@@ -9,7 +9,7 @@ The two share state through ``models/active``. Switch generation in the browser
 and this picks it up within a second, without a restart.
 
   o  both open          c  both closed
-  1  YOUR LEFT shut     2  YOUR RIGHT shut       (one frame per press)
+  l  YOUR LEFT shut     r  YOUR RIGHT shut       (one frame per press)
   h  save this frame as a detector test case (press when it says NO FACE)
   t  train a new PIXEL generation from the current dataset
   p  train a new POOLED generation (learned kernels, shift-invariant)
@@ -115,8 +115,9 @@ WIN_W, WIN_H = 1280, 740
 CAPTURES = {
     ord("o"): ("both OPEN", data.OPEN, data.OPEN),
     ord("c"): ("both CLOSED", data.CLOSED, data.CLOSED),
-    ord("1"): ("YOUR LEFT shut", data.CLOSED, data.OPEN),
-    ord("2"): ("YOUR RIGHT shut", data.OPEN, data.CLOSED),
+    # l and r, the same letters the gesture patterns use for the same eyes.
+    ord("l"): ("YOUR LEFT shut", data.CLOSED, data.OPEN),
+    ord("r"): ("YOUR RIGHT shut", data.OPEN, data.CLOSED),
 }
 # waitKeyEx codes for the arrows: the X11 keysym and the Qt keycode, because
 # which one arrives depends on the highgui backend the wheel was built with.
