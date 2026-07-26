@@ -54,11 +54,15 @@ A third lane shows the interval between verdicts in milliseconds, with the measu
 bar under it is a frame the pipeline dropped - which is the difference between "the
 detector lost the face" and "no frame arrived to look at".
 
-``--pattern`` (default ``l,r,r,l``, sides YOURS) is the wink sequence this project
-exists to detect: winks from open eyes only, both-shut resets the attempt - a
-natural blink is both-eyed - and the whole sequence must land within six seconds.
-The header counts winks as they land and flashes GESTURE on a match; nothing is
-gated on it yet, this is where the gesture gets practised against a live model.
+``--pattern`` (default ``l,r,r,l``, sides YOURS) is the gesture this project
+exists to detect. Four symbols, freely mixed: ``l``/``r`` are winks, scored as
+the eye shuts; ``long``/``short`` are both-eye closures, scored as the eyes
+reopen since duration is what tells them apart (0.5s and over is long - so
+``long,long,short`` is hold, hold, blink). Every event starts and ends at open
+eyes, an unexpected event resets the attempt, and the whole sequence must land
+within six seconds. The header counts events as they land and flashes GESTURE
+on a match; nothing is gated on it yet, this is where it gets practised
+against a live model.
 
 Capture runs in its own thread, feeding a short queue that discards its oldest
 frame when full. Serially, a pass over 133ms missed the next lit frame outright and
@@ -438,7 +442,7 @@ class App:
         elif g.matched_at is not None and v.stamp - g.matched_at < 2.0:
             state = f"GESTURE {','.join(g.pattern)}"
         elif g.progress:
-            state += f"   wink {g.progress}/{len(g.pattern)}"
+            state += f"   gesture {g.progress}/{len(g.pattern)}"
 
         ui.txt(annot, "DETECTION", ui.P(8, 22), 0.5, (0, 255, 0), 1.2)
         top = np.hstack([raw, annot])
@@ -505,7 +509,8 @@ def main():
     ap.add_argument("--thresh", type=float, default=0.5,
                     help="P(open) below this counts as shut")
     ap.add_argument("--pattern", type=pattern_arg, default=["l", "r", "r", "l"],
-                    help="wink sequence to match, YOUR left/right (l,r,r,l)")
+                    help="gesture to match: l/r winks (YOUR side), long/short "
+                         "both-eye closures (e.g. l,r,r,l or long,long,short)")
     ap.add_argument("--subtract", action="store_true",
                     help="subtract the unlit strobe frame to cancel ambient IR")
     ap.add_argument("--workers", type=int, default=1,
