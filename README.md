@@ -85,10 +85,16 @@ bursts spread across distances and head angles.
 
 Along the bottom, three time-synced lanes show the last 10 seconds: P(open) per
 eye — green where open, red where shut, and a hole where nothing could be
-classified — and the interval between frames in milliseconds, with the measured
-66 ms and 133 ms marked. Plotted against time rather than frame number, so a
-one-frame blink reads as narrower than a held closure instead of the same width,
-and a camera stall lines up with whatever the eyes were doing during it.
+classified — and the interval between verdicts in milliseconds, with the measured
+66 ms and 133 ms marked and a tick per frame the camera delivered. Plotted against
+time rather than frame number, so a one-frame blink reads as narrower than a held
+closure instead of the same width, and a tick with no bar under it is a frame the
+pipeline dropped.
+
+Capture runs in its own thread feeding a short drop-oldest queue, because serially
+a pass over 133 ms missed the next lit frame outright and the next usable one came
+266 ms later — the cost of being slightly slow was quantised. `--workers` and
+`--queue` tune it; the header reports capture rate, work time and drop counts.
 
 ### Label — `serve.py`
 

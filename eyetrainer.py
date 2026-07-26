@@ -41,10 +41,18 @@ gives ~7.5 usable frames a second and drops them unevenly, so on an index axis a
 one-frame blink and a four-frame hold are the same width. A frame where nothing
 could be classified is drawn as a hole, because a lost face is not an open eye.
 
-A third lane shows the interval between frames in milliseconds, with the measured
-66ms and 133ms marked. It shares the same time axis, so a camera stall lines up
-with whatever the eyes were doing during it - which is the difference between "the
+A third lane shows the interval between verdicts in milliseconds, with the measured
+66ms and 133ms marked, plus a tick per frame the camera delivered. A tick with no
+bar under it is a frame the pipeline dropped - which is the difference between "the
 detector lost the face" and "no frame arrived to look at".
+
+Capture runs in its own thread, feeding a short queue that discards its oldest
+frame when full. Serially, a pass over 133ms missed the next lit frame outright and
+the next usable one came 266ms later, so the cost of being slightly slow was
+quantised; the queue absorbs that and the verdict rate becomes the processing time
+instead. `--workers` adds processing threads (they overlap MediaPipe's inference
+but complete out of order) and `--queue` sets the buffer depth, where 1 is
+always-freshest and never-buffered.
 """
 
 import argparse
@@ -61,6 +69,7 @@ from bgate import data, ui
 from bgate.camera import IRCamera, DEFAULT_DEVICE
 from bgate.data import Dataset
 from bgate.detect import default_locator
+from bgate.pipeline import Pipeline
 from bgate.registry import Registry, train_and_register
 
 WIN = "blinkergate"
@@ -75,6 +84,22 @@ CAPTURES = {
     ord("1"): ("YOUR LEFT shut", data.CLOSED, data.OPEN),
     ord("2"): ("YOUR RIGHT shut", data.OPEN, data.CLOSED),
 }
+
+
+class Verdict:
+    """One processed frame, carried whole from a worker to the display.
+
+    The frame travels with its result: rendering needs the pixels, and a capture
+    keypress should record the frame you were looking at when you pressed - not
+    whatever the camera has produced since.
+    """
+
+    __slots__ = ("stamp", "gray", "det", "probs", "quads", "locator", "angle")
+
+    def __init__(self, stamp, gray, det, probs, quads, locator, angle):
+        self.stamp, self.gray, self.det = stamp, gray, det
+        self.probs, self.quads = probs, quads
+        self.locator, self.angle = locator, angle
 
 
 class App:
@@ -104,12 +129,42 @@ class App:
         self.gens = self.registry.ids()
         self.load_model()
 
-    def record(self, p_left, p_right):
-        now = time.monotonic()
-        self.history.append((now, p_left, p_right))
-        while self.history and self.history[0][0] < now - HISTORY_SECONDS:
+    def make_processor(self):
+        """A ``process(stamp, gray)`` for one worker thread.
+
+        Called inside the worker, so the locator it builds belongs to that thread
+        alone. ``self.model`` is re-read per frame rather than captured, because
+        `g` and `t` swap it from the main thread - and a reference read is the one
+        thing that is safe to do across threads without ceremony.
+        """
+        locator = default_locator()
+
+        def process(stamp, gray):
+            det = locator.locate(gray)
+            probs = quads = None
+            model = self.model
+            if det and model:
+                probs, _crops, quads = model.eyes(gray, det.landmarks,
+                                                  roll=det.roll)
+            return Verdict(stamp, gray, det, probs, quads, locator.used,
+                           getattr(locator, "angle", 0.0))
+        return process
+
+    def absorb(self, v):
+        """Take a worker's verdict into the display state.
+
+        Stamped with the time the frame was CAPTURED, not the time we finished
+        thinking about it. The timeline is about when the eye was in that state;
+        dating it by completion would smear every reading by the processing time
+        and make a slow pass look like a slow blink.
+        """
+        self.history.append((v.stamp, *(v.probs or (None, None))))
+        cutoff = v.stamp - HISTORY_SECONDS
+        while self.history and self.history[0][0] < cutoff:
             self.history.popleft()
-        return now
+        if v.det:
+            self.roll = v.angle
+            self.locator_used = v.locator
 
     def load_model(self, gen=None):
         if gen is None:
@@ -271,7 +326,11 @@ class App:
         # A mismatched blur is not a valid reading, so say so in red.
         return (0, 0, 255) if self.blur_mismatch() else (0, 200, 255)
 
-    def render(self, gray, det):
+    def render(self, v, pipe=None):
+        """Draw one verdict. Pure display - the probabilities were computed in a
+        worker and are not recomputed here, so a slow render costs smoothness and
+        nothing else."""
+        gray, det = v.gray, v.det
         raw = cv2.cvtColor(ui.enlarge(gray), cv2.COLOR_GRAY2BGR)
         annot = raw.copy()
         state = "no face"
@@ -280,11 +339,11 @@ class App:
 
         if det and det.landmarks is not None:
             ui.draw_face_frame(annot, det.landmarks, det.roll,
-                               label=f"{self.locator_used or ''} {det.roll:+.0f}deg".strip())
+                               label=f"{v.locator or ''} {det.roll:+.0f}deg".strip())
 
-        if det and self.model:
+        if det and v.probs is not None:
             lm = det.landmarks
-            probs, _crops, quads = self.model.eyes(gray, lm, roll=det.roll)
+            probs, quads = v.probs, v.quads
             shut = [p is not None and p < self.args.thresh for p in probs]
             # The quad, not a rectangle around it: the crop is cut in the levelled
             # frame, so an axis-aligned box would draw something the classifier
@@ -312,13 +371,8 @@ class App:
             state = ("BOTH SHUT" if all(shut) else
                      "YOUR LEFT shut" if shut[0] else
                      "YOUR RIGHT shut" if shut[1] else "open")
-            now = self.record(*probs)
-        else:
-            # Recorded even with nothing to classify, so the timeline shows the
-            # dropout instead of closing over it.
-            now = self.record(None, None)
-            if not self.model:
-                state = "no model - capture samples and press t"
+        elif not self.model:
+            state = "no model - capture samples and press t"
 
         ui.txt(annot, "DETECTION", ui.P(8, 22), 0.5, (0, 255, 0), 1.2)
         top = np.hstack([raw, annot])
@@ -334,9 +388,13 @@ class App:
             (f"dataset: {counts[data.OPEN]} open / {counts[data.CLOSED]} closed / "
              f"{counts[data.SKIP]} skip    roll "
              f"{det.roll if det else self.roll:+.0f}deg"
-             + (f"  via {self.locator_used}" if self.locator_used else ""),
+             + (f"  via {v.locator}" if v.locator else ""),
              0.45, (200, 200, 120)),
             (self.model_line(), 0.42, self.model_colour()),
+            # Pipeline health. A drop count is the whole reason for the threads:
+            # a frame we chose not to process and a frame that never arrived look
+            # identical in a frame rate, and only one of them is our fault.
+            (pipe.summary() if pipe else "", 0.38, (140, 170, 190)),
             # Built from CAPTURES rather than written out, so the legend cannot
             # come to disagree with what the keys actually do.
             ("capture   " + "   ".join(f"{chr(k)} {name}"
@@ -350,8 +408,13 @@ class App:
         # apart - drawing the subject's left eye under "YOUR RIGHT" is the
         # standing hazard in this codebase.
         lanes = [(i, tag) for i, (_side, _ring, tag) in enumerate(data.SIDES)][::-1]
-        strip = ui.timeline(top.shape[1], self.history, now, self.args.thresh,
-                            HISTORY_SECONDS, lanes)
+        # "now" is the newest CAPTURE, not the wall clock: the right edge should be
+        # the last thing the camera saw, so a stalled camera freezes the plot
+        # instead of scrolling an ever-widening blank off to the right.
+        strip = ui.timeline(top.shape[1], self.history,
+                            self.history[-1][0] if self.history else v.stamp,
+                            self.args.thresh, HISTORY_SECONDS, lanes,
+                            captures=pipe.capture.stamps if pipe else None)
         return np.vstack([top, band, strip])
 
 
@@ -366,18 +429,14 @@ def main():
                     help="P(open) below this counts as shut")
     ap.add_argument("--subtract", action="store_true",
                     help="subtract the unlit strobe frame to cancel ambient IR")
+    ap.add_argument("--workers", type=int, default=1,
+                    help="processing threads. More than one overlaps MediaPipe's "
+                         "inference but completes out of order")
+    ap.add_argument("--queue", type=int, default=2,
+                    help="frames buffered between capture and processing (1 = "
+                         "always the freshest, never one in hand)")
     args = ap.parse_args()
     ui.S = args.scale
-
-    try:
-        # Shared with the crop cache, so training crops and live crops are cut by
-        # the same stack. Finding a tilted face and locating the eyes inside it
-        # are different problems and only the first shows up in a detection rate;
-        # the refit inside this is worth 94.2% -> 95.4% upright and
-        # 69.7% -> 86.7% at 35 degrees of roll.
-        locator = default_locator(warn=print)
-    except FileNotFoundError as exc:
-        sys.exit(str(exc))
 
     app = App(args)
     try:
@@ -390,24 +449,32 @@ def main():
           + ("   ambient subtraction ON" if args.subtract else ""))
     print(f"{app.status}\nlabel and manage generations at:  uv run serve.py\n")
 
+    # Capture runs in its own thread so waiting for the camera and processing a
+    # frame stop being the same wall-clock time. Serial, a pass over 133ms missed
+    # the next lit frame entirely and the following usable one was 266ms later;
+    # the queue absorbs that, so the verdict interval is the processing time
+    # instead of the next multiple of 133ms.
+    pipe = Pipeline(cam, app.make_processor, workers=args.workers,
+                    frame_depth=args.queue).start()
+
     cv2.namedWindow(WIN, cv2.WINDOW_NORMAL)
     cv2.resizeWindow(WIN, int(WIN_W * ui.S), int(WIN_H * ui.S))
     fullscreen = False
+    latest = None
 
     while True:
-        gray = cam.read()
-        if gray is None:
-            if cv2.waitKey(1) & 0xFF == ord("q"):
-                break
-            continue
+        item = pipe.results.get(0.05)
+        if item is not None:
+            latest = item[1]
+            app.absorb(latest)
+            app.poll()
+            cv2.imshow(WIN, app.render(latest, pipe))
+        elif latest is None:
+            # Nothing has been processed yet. Say why rather than showing a blank
+            # window: a pipeline that died looks exactly like one still starting.
+            for name, err in pipe.errors():
+                sys.exit(f"{name} thread died: {err!r}")
 
-        app.poll()
-        det = locator.locate(gray)
-        if det:
-            app.roll = locator.angle
-            app.locator_used = locator.used
-
-        cv2.imshow(WIN, app.render(gray, det))
         key = cv2.waitKey(1) & 0xFF
         if key == ord("q"):
             break
@@ -421,10 +488,12 @@ def main():
             app.cycle_generation()
         elif key == ord("b"):
             app.cycle_blur()
+        elif latest is None:
+            pass            # the keys below all act on a frame; there is none yet
         elif key == ord("h"):
-            app.capture_hard(gray, det)
+            app.capture_hard(latest.gray, latest.det)
         elif key in CAPTURES:
-            app.capture(gray, det, *CAPTURES[key])
+            app.capture(latest.gray, latest.det, *CAPTURES[key])
         elif key in (ord("+"), ord("=")):
             ui.S = min(ui.S + 0.25, 4.0)
             cv2.resizeWindow(WIN, int(WIN_W * ui.S), int(WIN_H * ui.S))
@@ -437,6 +506,11 @@ def main():
                                   cv2.WINDOW_FULLSCREEN if fullscreen else
                                   cv2.WINDOW_NORMAL)
 
+    # Threads first, then the device: releasing the camera under a capture loop
+    # still reading from it is how you get a segfault on the way out.
+    pipe.stop()
+    for name, err in pipe.errors():
+        print(f"  {name} thread ended with: {err!r}")
     cam.release()
     cv2.destroyAllWindows()
 

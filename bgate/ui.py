@@ -177,9 +177,10 @@ FRAME_REFS = (66, 133)      # measured: camera interval, and after the strobe dr
 FRAME_BAR = (150, 116, 60)
 FRAME_OVER = (60, 150, 220)     # off the top of the scale, so it cannot be read
 FRAME_BG = (30, 30, 34)
+CAPTURE_TICK = (215, 215, 225)   # one per frame the camera delivered
 
 
-def _frame_lane(panel, top, bot, x0, x1, xof, pts):
+def _frame_lane(panel, top, bot, x0, x1, xof, pts, captures=None):
     """Frame interval as bars, one per gap between consecutive samples.
 
     A bar spans exactly the interval it measures, so it lines up with whatever
@@ -201,6 +202,15 @@ def _frame_lane(panel, top, bot, x0, x1, xof, pts):
         panel[bot - h - 1:bot - 1, xa:xb] = (
             FRAME_OVER if ms > FRAME_MS_MAX else FRAME_BAR)
 
+    # A tick per captured frame, along the top of the lane. A tick with no bar
+    # starting under it is a frame the camera delivered and the pipeline dropped -
+    # which is the one thing a frame rate on its own can never tell you.
+    if captures:
+        for t in captures:
+            x = xof(t)
+            if x0 <= x < x1:
+                panel[top:top + max(2, int(3 * S)), x:x + 1] = CAPTURE_TICK
+
     # After the bars, not before: at the normal 133ms the bars are taller than the
     # 66ms line and were hiding it, which left the lane with one reference instead
     # of two.
@@ -212,7 +222,8 @@ def _frame_lane(panel, top, bot, x0, x1, xof, pts):
                            y - int(3 * S)), 0.26, (215, 215, 220))
 
 
-def timeline(width, history, now, thresh, window, lanes, frame_time=True):
+def timeline(width, history, now, thresh, window, lanes, frame_time=True,
+             captures=None):
     """Time-synced lanes of P(open), most recent at the right edge.
 
     ``history`` is an iterable of ``(t, p0, p1)`` with ``None`` for a frame where
@@ -296,7 +307,8 @@ def timeline(width, history, now, thresh, window, lanes, frame_time=True):
 
     if frame_time:
         top = head_h + len(lanes) * lane_h
-        _frame_lane(panel, top, top + frame_h - int(3 * S), x0, x1, xof, pts)
+        _frame_lane(panel, top, top + frame_h - int(3 * S), x0, x1, xof,
+                    pts, captures)
         gaps = sorted((b[0] - a[0]) * 1000.0 for a, b in zip(pts, pts[1:]))
         # The median, not the newest: one interval is noise, and the median is
         # what the frame budget actually is.

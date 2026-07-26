@@ -37,6 +37,13 @@ class IRCamera:
         self.dark = None            # most recent unlit frame
         self._dark_t = 0.0
         self.lit = None             # most recent lit frame, before subtraction
+        # read() returns None for an unlit frame and for a failed read alike, so
+        # only this class can tell them apart. Counted here because a camera that
+        # has stopped delivering and a camera that is merely strobing look the
+        # same from outside, and the difference is worth being able to see.
+        self.lit_count = 0
+        self.unlit_count = 0
+        self.fail_count = 0
         self.lit_cutoff = self._calibrate(calibrate_seconds)
 
     def _read_gray(self):
@@ -65,11 +72,14 @@ class IRCamera:
         """
         g = self._read_gray()
         if g is None:
+            self.fail_count += 1
             return None
         if g.mean() < self.lit_cutoff:
+            self.unlit_count += 1
             self.dark = g
             self._dark_t = time.time()
             return None
+        self.lit_count += 1
         self.lit = g
         if not self.subtract:
             return g

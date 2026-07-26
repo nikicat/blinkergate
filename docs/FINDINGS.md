@@ -34,6 +34,69 @@ which is an excellent way to convince yourself a working detector never fires.
 **Capture latency**: the V4L2 buffer defaults to about 4 frames deep — ~264 ms of
 lag. `CAP_PROP_BUFFERSIZE = 1` brings it to one frame, 66 ms.
 
+### Falling behind costs 133 ms, not a millisecond
+
+The "~7.5 usable fps" above is a **camera** measurement — `grab()` alone, no
+processing. The end-to-end rate was never measured until the live view grew a
+frame-time lane, and it showed 260 ms intervals, not 133.
+
+The reason is that the cost is **quantised**. Lit frames arrive every 133 ms; a
+pass that runs 1 ms over misses one entirely, the strobe then hands over an unlit
+frame to discard, and the next usable frame is 266 ms after the last. There is no
+value between.
+
+Per-frame cost, measured on real frames at UI scale 2:
+
+| stage | median |
+|---|---|
+| mesh, one pass | 31.8 ms |
+| `LevelRefit(mesh)` — two passes | 64.3 ms |
+| `default_locator` (what runs) | 61.2 ms |
+| `model.eyes` (classify) | 0.9 ms |
+| render | 22.8 ms |
+
+| `default_locator` on | median | p90 | max |
+|---|---|---|---|
+| dataset frames (easy) | 49.5 ms | 69.4 ms | 110.1 ms |
+| **frames where detection struggles** | 68.4 ms | **125.7 ms** | **211.6 ms** |
+
+Adding render, the easy case sits at ~73 ms and the hard case at ~91 ms median but
+149 ms at p90 — straddling the line, which is what makes the observed rate flicker
+between 133 and 266.
+
+**`LevelRefit` fires on 54% of frames**, because its deadzone is 3° and the median
+|head roll| here is 3.2° — the threshold sits at the middle of the distribution. It
+was chosen from a noise argument ("measured roll wanders a degree or two") without
+looking at how much roll a head actually has.
+
+| deadzone | fires on | mean detection cost |
+|---|---|---|
+| 3° (as shipped) | 54% | 49 ms |
+| 8° | 15% | 37 ms |
+| 20° | 5% | 33 ms |
+
+From the roll table, the refit is worth 7–9 points at ±20° and **0.3 points at 0°**,
+so most of those 54% are paying 33 ms for nothing. Raising the deadzone is
+unmeasured but cheap; `roll_sweep.py --angles=-15,-10,-5,0,5,10,15` would place it.
+
+### Concurrency removes the quantisation
+
+`bgate/pipeline.py` runs capture in its own thread, feeding a bounded queue that
+drops its oldest frame when full. Waiting for the camera and processing a frame stop
+being the same wall-clock time, so throughput becomes **1/T** instead of
+1/(⌈T/133⌉·133). Measured against a synthetic strobing camera:
+
+| processing time | serial (quantised) | concurrent |
+|---|---|---|
+| 60 ms | 7.5/s | 7.7/s |
+| 180 ms | 3.8/s | **5.7/s** |
+| 233 ms | 3.8/s | **4.2/s** |
+
+The gain is largest just above a multiple of 133 ms, and it cannot exceed the
+capture rate — you can only process frames that exist. **It does not make anything
+faster.** What it changes is that falling behind now costs what it costs, and every
+dropped frame is counted rather than showing up as an unexplainable frame rate.
+
 ---
 
 ## MediaPipe
