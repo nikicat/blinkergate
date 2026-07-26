@@ -91,10 +91,12 @@ time rather than frame number, so a one-frame blink reads as narrower than a hel
 closure instead of the same width, and a tick with no bar under it is a frame the
 pipeline dropped.
 
-Capture runs in its own thread feeding a short drop-oldest queue, because serially
-a pass over 133 ms missed the next lit frame outright and the next usable one came
-266 ms later — the cost of being slightly slow was quantised. `--workers` and
-`--queue` tune it; the header reports capture rate, work time and drop counts.
+Capture runs in its own thread feeding a short drop-oldest queue. Serially, waiting
+for the camera and processing a frame were the same wall-clock time, and their sum
+crossed the 133 ms the strobe allows — which cost a whole frame, not the overshoot,
+so the real rate was 260 ms. Splitting them gives a **stable 132 ms**, every lit
+frame processed. `--workers` and `--queue` tune it; the header reports capture rate,
+work time and drop counts.
 
 ### Label — `serve.py`
 

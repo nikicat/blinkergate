@@ -16,6 +16,8 @@ earlier ones that were wrong, and the ways they were wrong repeat.
 | advertised | 30 fps |
 | **actually delivered** | **15.1 fps**, uniform 66 ms intervals |
 | after discarding unlit strobe frames | **~7.5 fps** |
+| end to end, serial capture-then-process | ~3.8 fps (260 ms) |
+| end to end, concurrent capture | **7.6 fps (132 ms)** |
 | eye width at normal seating distance | 16–19 px |
 | V4L2 controls exposed | `region_of_interest` only — no exposure, gain or rate |
 
@@ -96,6 +98,19 @@ The gain is largest just above a multiple of 133 ms, and it cannot exceed the
 capture rate — you can only process frames that exist. **It does not make anything
 faster.** What it changes is that falling behind now costs what it costs, and every
 dropped frame is counted rather than showing up as an unexplainable frame rate.
+
+**Confirmed on the hardware: a stable 132 ms**, against "often 260 ms, 133 ms rare"
+before. That is every lit frame processed — 3.8 verdicts a second to 7.6, a
+doubling.
+
+Which also corrects the emphasis above. The table frames the win as *throughput
+becoming 1/T*, and that is the case when processing genuinely exceeds 133 ms. But
+this hardware's processing was only ~73–91 ms, comfortably inside the window; what
+pushed it over was that **waiting for the camera and processing a frame were the
+same wall-clock time**. Serially the loop paid both, and their sum crossed 133 ms.
+The queue removes the sum, not the processing. So the common case is not "we are too
+slow" but "we were made to wait and then be slow", and it is worth more than the
+synthetic table suggests.
 
 ---
 
