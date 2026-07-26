@@ -397,6 +397,44 @@ def timeline(width, history, now, thresh, window, lanes, frame_time=True,
     return panel
 
 
+def inset_strip(width, groups):
+    """One pair of eye insets under each camera pane above it.
+
+    ``groups`` is a pair of insets per pane, in the order they should read
+    left to right - which is the REVERSE of the dataset's, because your left
+    eye appears on the image's right. Centred under its own pane so the eyes
+    sit beneath the face they were cut from.
+    """
+    band = np.full((int(INSET_H * S), width, 3), 18, np.uint8)
+    iw, gap = int(INSET_W * S), int(8 * S)
+    span = width // max(len(groups), 1)
+    for g, pair in enumerate(groups):
+        block = len(pair) * iw + (len(pair) - 1) * gap
+        x = g * span + max((span - block) // 2, 0)
+        for inset in pair:
+            if x + iw <= width:
+                band[:, x:x + iw] = inset
+            x += iw + gap
+    return band
+
+
+def text_pane(width, lines):
+    """The status lines, full width, in their own pane.
+
+    A pane rather than a column beside the insets: comparing two modes puts
+    four insets across the frame and leaves no width to sit next to.
+    Row height follows text size, so the big state line gets its room and the
+    small legends do not waste any.
+    """
+    rows = [int((size * 30 + 16) * S) for _line, size, _colour in lines]
+    pane = np.full((sum(rows) + int(10 * S), width, 3), 18, np.uint8)
+    y = 0
+    for (line, size, colour), h in zip(lines, rows):
+        y += h
+        txt(pane, line, (int(20 * S), y), size, colour, 1.2)
+    return pane
+
+
 def inset_row(left_in, right_in, width, lines):
     """Both eye insets side by side with a text column to their right."""
     band = np.full((int(INSET_H * S), width, 3), 18, np.uint8)

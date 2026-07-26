@@ -178,6 +178,7 @@ class App:
         self.history = deque()
         self.paused = False
         self.sel = 0                 # index into history while paused
+        self.strip_top = 0           # y of the timeline, set by render
         self.gesture = GestureMatcher(args.pattern, thresh=args.thresh)
         self.gens = self.registry.ids()
         self.load_model()
@@ -483,7 +484,7 @@ class App:
         if compare:
             # The raw camera pane is dropped, not the detection: the annotated
             # pane already shows those pixels, so the space buys the second mode.
-            alt_annot, _alt_insets, alt_state = self.draw_pane(
+            alt_annot, alt_insets, alt_state = self.draw_pane(
                 v.alt, "AMBIENT-SUBTRACTED")
             top = np.hstack([annot, alt_annot])
             agree = state == alt_state
@@ -508,8 +509,7 @@ class App:
             state += f"   gesture {g.progress}/{len(g.pattern)}"
 
         counts = self.dataset.counts()
-        # Laid out to match the picture: your left eye is on the image's right.
-        band = ui.inset_row(insets[1], insets[0], top.shape[1], [
+        lines = [
             (state, 0.85, state_colour),
             # This frame's roll, not the tracked one: it is the angle the crops
             # were actually levelled by, and showing the tracker's instead put two
@@ -531,7 +531,18 @@ class App:
              0.38, (180, 180, 140)),
             ("h hard case   SPACE pause+scrub   t train pixel   p train pooled"
              "   g cycle generation   b blur   q quit", 0.38, (150, 150, 150)),
-        ])
+        ]
+        # Laid out to match the picture: your left eye is on the image's right.
+        if compare:
+            # Each mode's eyes under its own pane, and the text below both -
+            # four insets leave no width for a column beside them.
+            band = np.vstack([
+                ui.inset_strip(top.shape[1], [(insets[1], insets[0]),
+                                              (alt_insets[1], alt_insets[0])]),
+                ui.text_pane(top.shape[1], lines),
+            ])
+        else:
+            band = ui.inset_row(insets[1], insets[0], top.shape[1], lines)
         # Reversed to match the insets above, which match the picture. The index
         # into the history travels with its label so the two cannot be reordered
         # apart - drawing the subject's left eye under "YOUR RIGHT" is the
@@ -553,6 +564,10 @@ class App:
                             captures=pipe.capture.stamps if pipe else None,
                             cursor=v.stamp if self.paused else None,
                             lane_height=ui.LANE_H_COMPACT if compare else None)
+        # Where the strip begins, for the click handler. Recorded rather than
+        # recomputed: the layout above it changes with the mode, and a second
+        # copy of that arithmetic is a selection that lands on the wrong row.
+        self.strip_top = top.shape[0] + band.shape[0]
         return np.vstack([top, band, strip])
 
 
@@ -628,7 +643,7 @@ def main():
         """
         if event != cv2.EVENT_LBUTTONDOWN or not app.paused or not app.history:
             return
-        if y < int((360 + ui.INSET_H) * ui.S):  # strip is below frames + band
+        if not app.strip_top or y < app.strip_top:      # above the timeline
             return
         x0 = int(ui.TIMELINE_GUTTER * ui.S)
         plot_w = max(int(2 * 640 * ui.S) - int(10 * ui.S) - x0, 1)
@@ -682,7 +697,10 @@ def loop(app, pipe):
     # that as a close would have quit before drawing anything.
     was_visible = False
 
+    shown = None            # the image size the window is currently sized to
+
     while True:
+        img = None
         if app.paused:
             # Polled here too: a model activated in the web UI mid-pause lands
             # via load_model, which re-scores the frozen frames.
@@ -690,14 +708,14 @@ def loop(app, pipe):
             # ponytail: a static frame redrawn at ~20Hz, so capture feedback and
             # mouse selection show up without dirty-flag bookkeeping.
             target = app.history[app.sel]
-            cv2.imshow(WIN, app.render(target, pipe))
+            img = app.render(target, pipe)
         else:
             item = pipe.results.get(0.05)
             if item is not None:
                 latest = item[1]
                 app.absorb(latest)
                 app.poll()
-                cv2.imshow(WIN, app.render(latest, pipe))
+                img = app.render(latest, pipe)
             elif latest is None:
                 # Nothing has been processed yet. Say why rather than showing a
                 # blank window: a pipeline that died looks exactly like one still
@@ -705,6 +723,16 @@ def loop(app, pipe):
                 for name, err in pipe.errors():
                     sys.exit(f"{name} thread died: {err!r}")
             target = latest
+
+        if img is not None:
+            cv2.imshow(WIN, img)
+            # The window follows the image rather than a fixed WIN_H: comparing
+            # two modes stacks a taller layout, and a window sized to the other
+            # one just stretches it. Only on a change, so a window the user has
+            # dragged to their own size is left alone.
+            if not fullscreen and shown != img.shape[:2]:
+                shown = img.shape[:2]
+                cv2.resizeWindow(WIN, img.shape[1], img.shape[0])
 
         # waitKeyEx, because the arrows vanish under & 0xFF. The mask is still
         # right for the ASCII keys and cannot collide: an arrow's low byte is a
@@ -750,11 +778,9 @@ def loop(app, pipe):
         elif key in CAPTURES:
             app.capture(target.gray, target.det, *CAPTURES[key])
         elif key in (ord("+"), ord("=")):
-            ui.S = min(ui.S + 0.25, 4.0)
-            cv2.resizeWindow(WIN, int(WIN_W * ui.S), int(WIN_H * ui.S))
+            ui.S = min(ui.S + 0.25, 4.0)     # the window follows on next render
         elif key == ord("-"):
             ui.S = max(ui.S - 0.25, 0.75)
-            cv2.resizeWindow(WIN, int(WIN_W * ui.S), int(WIN_H * ui.S))
         elif key == ord("f"):
             fullscreen = not fullscreen
             cv2.setWindowProperty(WIN, cv2.WND_PROP_FULLSCREEN,
