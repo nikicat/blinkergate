@@ -17,11 +17,9 @@
 //! - which convention was used is stamped into every model generation, and
 //!   [`Geometry::check`] refuses a model that was fitted under a different one.
 
-use std::fmt;
-
 use serde::Deserialize;
 
-use crate::frame::{Frame, Px, Raster, Sampling, Size, round_u8};
+use crate::frame::{Frame, Grey, Px, Raster, Sampling, Size};
 use crate::model::ModelError;
 use crate::side::PerEye;
 
@@ -105,16 +103,16 @@ impl Roll {
         Roll(deg)
     }
 
+    /// Magnitude, for the deadzone comparisons that do not care which way a head is
+    /// tilted.
+    pub fn abs(self) -> Roll {
+        Roll(self.0.abs())
+    }
+
     /// The rotation this roll stands for.
     pub fn turn(self) -> Turn {
         let (sin, cos) = self.0.to_radians().sin_cos();
         Turn { sin, cos }
-    }
-}
-
-impl fmt::Display for Roll {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(f, "{:.1}deg", self.0)
     }
 }
 
@@ -253,7 +251,7 @@ impl Geometry {
     /// and a width produces crops the model recognises.
     pub fn crop_at(&self, frame: &Frame, eye: &Eye, roll: Roll) -> Crop {
         let sampling = self.sampling(eye, roll);
-        Crop::from_fn(self.size(), |x, y| round_u8(frame.sample(sampling.at(x, y))))
+        Crop::from_positions(self.size(), |at| Grey::round(frame.sample(sampling.at_point(at))))
     }
 
     /// Which part of the frame this crop's pixels come from.

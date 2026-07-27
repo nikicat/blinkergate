@@ -205,10 +205,20 @@ impl Model {
     pub fn load(path: impl AsRef<Path>) -> Result<Option<Model>> {
         let path = path.as_ref();
         let Some(text) = crate::trust::read_root_owned(path)? else { return Ok(None) };
-        let model: Model = serde_json::from_str(&text)
-            .map_err(|source| Error::Json { path: path.into(), source })?;
-        model.check().map_err(|source| Error::Model { path: path.into(), source })?;
-        Ok(Some(model))
+        Model::parse(&text, path).map(Some)
+    }
+
+    /// Parse and check a model without asking who owns the file.
+    ///
+    /// For the two callers that legitimately hold an untrusted one: enrolment, which
+    /// must be able to reject a freshly exported model *before* installing it
+    /// root-owned, and `bgatectl check`, which is a lint. `from` names the file in any
+    /// error - it is not read.
+    pub fn parse(text: &str, from: &Path) -> Result<Model> {
+        let model: Model = serde_json::from_str(text)
+            .map_err(|source| Error::Json { path: from.into(), source })?;
+        model.check().map_err(|source| Error::Model { path: from.into(), source })?;
+        Ok(model)
     }
 
     /// Everything that has to be true before these weights mean anything.
@@ -418,10 +428,10 @@ impl Window {
 fn standardise(crop: &Crop) -> Vec<f32> {
     let px = crop.px();
     let n = px.len() as f32;
-    let mean = px.iter().map(|&p| f32::from(p)).sum::<f32>() / n;
-    let var = px.iter().map(|&p| (f32::from(p) - mean).powi(2)).sum::<f32>() / n;
+    let mean = px.iter().map(|p| p.value()).sum::<f32>() / n;
+    let var = px.iter().map(|p| (p.value() - mean).powi(2)).sum::<f32>() / n;
     let scale = 1.0 / (var.sqrt() + 1e-6);
-    px.iter().map(|&p| (f32::from(p) - mean) * scale).collect()
+    px.iter().map(|p| (p.value() - mean) * scale).collect()
 }
 
 /// The head predicts P(closed); the pipeline speaks P(open) throughout.

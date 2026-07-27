@@ -21,20 +21,28 @@
 //! and its own measurements. Where a comment below says a figure was measured, it
 //! means measured there.
 
+pub mod camera;
 pub mod config;
 pub mod crop;
+pub mod daemon;
+pub mod detect;
 pub mod error;
 pub mod frame;
 pub mod gesture;
 pub mod model;
 pub mod side;
 pub mod trust;
+pub mod watch;
 
+pub use camera::{Frames, Read};
 pub use config::Config;
 pub use crop::{Crop, Cut, Eye, Geometry, Landmark, Landmarks, Located, Pt, Roll, Turn};
+pub use daemon::Daemon;
+pub use detect::{Locator, Mesh};
 pub use error::{Error, Result};
-pub use frame::{Captured, Frame, Px, Raster, Size};
+pub use frame::{Brightness, Captured, Frame, Grey, Px, Raster, Size, Spread};
 pub use gesture::{Matcher, Progress, Sym, Verdict};
-pub use model::{Kind, Model, ModelError, Normalise};
+pub use model::{Kind, Model, ModelError, Normalise, Probability};
 pub use side::{PerEye, Side};
 pub use trust::Mode;
+pub use watch::{Outcome, Tally, watch};

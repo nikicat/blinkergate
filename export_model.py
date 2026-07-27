@@ -41,8 +41,18 @@ FORMAT = "blinkergate-model/1"
 GOLDEN_FORMAT = "blinkergate-golden/1"
 GOLDEN_PATH = "rust/gate/tests/golden.json"
 
-# The synthetic frame, as an integer formula rather than committed pixels: both
-# sides compute it, so there is nothing to keep in sync but the expression.
+# The frame the crop cases are cut from, as an integer formula rather than committed
+# pixels: 96x72 of them would be 12KB of JSON, and both sides have to agree on every
+# one, so an expression with nothing in it but integer arithmetic is the smaller thing
+# to keep in step. It is written into the golden file so the Rust side can be held to
+# the same one.
+#
+# What the expression has to *be* is high-frequency - adjacent pixels uncorrelated. On a
+# smooth image a sampler that misses by half a pixel produces almost the same crop, so
+# the conformance test would pass with the geometry wrong. The particular numbers are
+# arbitrary primes; they only have to be coprime with each other and with the 40x24 crop
+# grid and 11x11 kernel, so that no period in the pattern lines up with what is being
+# tested.
 GOLDEN_W, GOLDEN_H = 96, 72
 FORMULA = "((x*7 + y*13) % 251) ^ ((x*y) % 97)"
 
@@ -197,7 +207,11 @@ def golden():
               for b in (True, False)]
     return {
         "format": GOLDEN_FORMAT,
-        "frame": {"w": GOLDEN_W, "h": GOLDEN_H, "formula": FORMULA},
+        # The checksum is what makes a divergence say so: without it, a frame the two
+        # sides no longer generate identically shows up as crops 180 grey levels apart,
+        # which is indistinguishable from a resampling bug.
+        "frame": {"w": GOLDEN_W, "h": GOLDEN_H, "formula": FORMULA,
+                  "checksum": int(golden_frame().sum())},
         "rings": rings(),
         "model": as_json(obj, "synthetic", {}),
         "cases": cases,

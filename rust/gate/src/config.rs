@@ -48,6 +48,10 @@ pub fn state_dir() -> &'static Path {
 ///
 /// Every field has a working default, so an absent file is not an error and the
 /// per-user layer only has to name what it changes.
+///
+/// **Every duration here is written in seconds** - `timeout = 15`, `long_min = 0.25`.
+/// That is what the `secs` attribute on those fields is for: `Duration`'s own serde
+/// form is `{ secs, nanos }`, which nobody is typing into a config file.
 #[derive(Debug, Clone, Deserialize)]
 #[serde(deny_unknown_fields, default)]
 pub struct Config {
@@ -59,8 +63,7 @@ pub struct Config {
     /// but contrast 15.3 -> 11.9, i.e. slightly down. Where it should help is
     /// non-uniform ambient - shadows, a window reflection.
     pub subtract: bool,
-    /// How long to watch before giving up and letting the password prompt have
-    /// it. Seconds in the file.
+    /// How long to watch before giving up and letting the password prompt have it.
     #[serde(deserialize_with = "secs")]
     pub timeout: Duration,
     /// `[gesture]`: what to demand, and what counts as having performed it.
@@ -73,6 +76,30 @@ pub struct Config {
     /// `[limit]`: what happens after repeated failures, so a photograph cannot be
     /// retried all night.
     pub limit: LimitConfig,
+    /// `[replay]`: read frames from disk instead of the camera. Absent normally.
+    pub replay: ReplayConfig,
+}
+
+/// The `[replay]` section: frames from a directory instead of a camera.
+///
+/// For the end-to-end test. A virtual machine has no `/dev/video*`, and a gesture is
+/// the one thing a synthetic frame cannot contain - so record a real one on the host
+/// and replay it wherever the PAM stack is being exercised.
+///
+/// Its own section rather than a magic `device` value, because a device path and a
+/// directory of recordings are different things and a daemon that silently accepted
+/// either would be one typo away from authenticating against yesterday's frames.
+#[derive(Debug, Clone, Default, Deserialize)]
+#[serde(deny_unknown_fields, default)]
+pub struct ReplayConfig {
+    /// When set, the camera is not opened at all. Root-owned like everything else the
+    /// gate trusts: a directory of frames the user can write is a recording of
+    /// whatever gesture they like.
+    ///
+    /// The rate is *not* configured here - it is in the recording's own `replay.toml`,
+    /// because replaying frames faster than they were recorded changes a held closure
+    /// into a blink.
+    pub dir: Option<PathBuf>,
 }
 
 impl Default for Config {
@@ -85,6 +112,7 @@ impl Default for Config {
             model: ModelConfig::default(),
             detector: DetectorConfig::default(),
             limit: LimitConfig::default(),
+            replay: ReplayConfig::default(),
         }
     }
 }
@@ -274,11 +302,13 @@ impl Default for LimitConfig {
 
 /// A duration written as seconds, which is how a human writes one.
 ///
+/// `pub(crate)` because a replay's manifest declares its frame interval the same way.
+///
 /// `Duration`'s own serde form is `{ secs, nanos }`; nobody is typing that into a
 /// config file. Hand-written for the same reason [`Pattern`]'s is: an integer stays
 /// an integer (`Duration::from_secs`, exact), a float is checked by
 /// `try_from_secs_f64`, and each way of being wrong says so in its own words.
-fn secs<'de, D: Deserializer<'de>>(d: D) -> std::result::Result<Duration, D::Error> {
+pub(crate) fn secs<'de, D: Deserializer<'de>>(d: D) -> std::result::Result<Duration, D::Error> {
     struct V;
 
     impl de::Visitor<'_> for V {

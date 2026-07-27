@@ -54,6 +54,20 @@ pub enum Error {
     #[error("{} is writable by non-root (mode {mode})", path.display())]
     Writable { path: Box<Path>, mode: Mode },
 
+    /// The kernel's CSPRNG refused, which is the one failure that must never be
+    /// papered over: without fresh bytes the challenge would not be random.
+    #[error("the CSPRNG refused: {0}")]
+    Random(#[from] getrandom::Error),
+
+    /// MediaPipe would not load or would not run. Carries its message rather than
+    /// its type: the daemon logs this and falls through to the password either way.
+    #[error("mediapipe: {why}")]
+    Mesh { why: String },
+
+    /// The frame source will not deliver what the pipeline needs.
+    #[error("{}: {why}", path.display())]
+    Camera { path: Box<Path>, why: String },
+
     /// A key whose value is syntactically fine and operationally nonsense.
     #[error("{key}: {why}")]
     Config { key: &'static str, why: String },

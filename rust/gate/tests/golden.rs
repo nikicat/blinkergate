@@ -22,7 +22,7 @@
 //! claim cannot quietly stop being true.
 
 use blinkergate::crop::{Landmark, RING_L, RING_MAX, RING_R};
-use blinkergate::{Crop, Eye, Frame, Kind, Model, ModelError, Normalise, Px, Roll, Size};
+use blinkergate::{Crop, Eye, Frame, Grey, Kind, Model, ModelError, Normalise, Px, Roll, Size};
 use serde::Deserialize;
 
 #[derive(Deserialize)]
@@ -46,6 +46,9 @@ struct FrameSpec {
     w: usize,
     h: usize,
     formula: String,
+    /// The sum of every pixel the exporter generated. See
+    /// [`both_sides_generate_the_same_frame`].
+    checksum: u64,
 }
 
 #[derive(Deserialize)]
@@ -54,17 +57,17 @@ struct Case {
     cy: f32,
     width: f32,
     roll: f32,
-    crop: Vec<u8>,
+    crop: Vec<Grey>,
     p_open: f32,
     /// Present only where `data.crop_at` would take its integer-box path.
     #[serde(default)]
-    crop_box: Option<Vec<u8>>,
+    crop_box: Option<Vec<Grey>>,
 }
 
 #[derive(Deserialize)]
 struct Shaped {
     note: String,
-    crop: Vec<u8>,
+    crop: Vec<Grey>,
     p_open: f32,
 }
 
@@ -72,29 +75,86 @@ fn load() -> Golden {
     let text = include_str!("golden.json");
     let golden: Golden = serde_json::from_str(text).expect("golden.json parses");
     assert_eq!(golden.format, "blinkergate-golden/1");
-    // The frame is a formula on both sides; if the expression ever changes on one
-    // of them, every crop below would still agree with itself.
-    assert_eq!(golden.frame.formula, "((x*7 + y*13) % 251) ^ ((x*y) % 97)");
     golden
 }
 
-/// The same integer expression the exporter uses. Kept as a literal formula on
-/// both sides so the committed file stays small and there is nothing to drift but
-/// this line - which `golden.frame.formula` then pins.
+/// The frame every crop case is cut from.
+///
+/// A formula rather than committed pixels: 96x72 of them would be 12KB of JSON, and both
+/// sides have to agree on every one, so an expression with nothing in it but integer
+/// arithmetic is the smaller thing to keep in step. `golden.frame.formula` pins that the
+/// two sides still write the same one.
+///
+/// What the expression has to *be* is high-frequency - adjacent pixels uncorrelated. On a
+/// smooth image a sampler that misses by half a pixel produces almost the same crop, so
+/// this test would pass with the geometry wrong; on this one it cannot. The evidence that
+/// the frame is that sensitive is `python_box_path_is_a_different_resampler`, where two
+/// genuinely different resamplers land 181 grey levels apart on it.
+///
+/// The particular numbers are arbitrary primes. They only have to be coprime with each
+/// other and with the crop's 40x24 grid and the kernel's 11x11 window, so that no period
+/// in the pattern lines up with anything being tested.
 fn synth_frame(size: Size) -> Frame {
-    Frame::from_fn(size, |x, y| u8::try_from(((x * 7 + y * 13) % 251) ^ ((x * y) % 97)).unwrap())
+    // Integer arithmetic on indices, so this builds the buffer rather than going
+    // through `from_positions` and casting coordinates back.
+    let mut px = Vec::with_capacity(size.area());
+    for y in 0..size.height {
+        for x in 0..size.width {
+            px.push(Grey::new(u8::try_from(((x * 7 + y * 13) % 251) ^ ((x * y) % 97)).unwrap()));
+        }
+    }
+    Frame::new(size, px).expect("the formula fills every pixel")
 }
 
-fn diff(got: &[u8], want: &[u8]) -> (u32, f64) {
-    assert_eq!(got.len(), want.len());
-    let mut max = 0u32;
-    let mut sum = 0u64;
-    for (a, b) in got.iter().zip(want) {
-        let d = u32::from(a.abs_diff(*b));
-        max = max.max(d);
-        sum += u64::from(d);
+/// How far two rasters of the same size are apart, in grey levels.
+///
+/// Both numbers, because they answer different questions: `worst` catches a single
+/// pixel sampled from the wrong place, which an average of 960 would bury, and `mean`
+/// catches a whole crop drifting by a fraction of a level, which a maximum of 1 would
+/// call acceptable.
+struct Difference {
+    worst: u32,
+    mean: f64,
+}
+
+impl std::fmt::Display for Difference {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "max |d| {}  mean |d| {:.4}", self.worst, self.mean)
     }
-    (max, sum as f64 / got.len() as f64)
+}
+
+fn diff(got: &[Grey], want: &[Grey]) -> Difference {
+    assert_eq!(got.len(), want.len());
+    let mut worst = 0u32;
+    let mut total = 0u64;
+    for (a, b) in got.iter().zip(want) {
+        let d = u32::from(a.raw().abs_diff(b.raw()));
+        worst = worst.max(d);
+        total += u64::from(d);
+    }
+    Difference { worst, mean: total as f64 / got.len() as f64 }
+}
+
+/// The two sides still generate the same frame.
+///
+/// Checked on its own, and before anything is cut from it, because otherwise a frame
+/// that has diverged shows up as crops 180 grey levels apart - which is exactly what a
+/// resampling bug looks like. Two chances to notice: the expression, which catches a
+/// deliberate change on either side, and the checksum, which catches a change made to
+/// one side's arithmetic without the other's.
+#[test]
+fn both_sides_generate_the_same_frame() {
+    let g = load();
+    assert_eq!(
+        g.frame.formula, "((x*7 + y*13) % 251) ^ ((x*y) % 97)",
+        "the exporter and this test no longer write the same expression"
+    );
+    let frame = synth_frame(Size { width: g.frame.w, height: g.frame.h });
+    let sum: u64 = frame.px().iter().map(|p| u64::from(p.raw())).sum();
+    assert_eq!(
+        sum, g.frame.checksum,
+        "the same expression evaluates differently here than in the exporter"
+    );
 }
 
 #[test]
@@ -117,13 +177,10 @@ fn crops_match_opencv() {
     for case in &g.cases {
         let eye = Eye { centre: Px { x: case.cx, y: case.cy }, width: case.width };
         let got = g.model.crop.crop_at(&frame, &eye, Roll::degrees(case.roll));
-        let (max, mean) = diff(got.px(), &case.crop);
-        println!(
-            "roll {:>6.2}  centre ({:.1}, {:.1})  max |d| {max}  mean |d| {mean:.4}",
-            case.roll, case.cx, case.cy
-        );
-        assert!(max <= 1, "crop differs by {max} grey levels, not fixed-point noise");
-        assert!(mean <= 0.01, "crop differs by {mean:.4} on average");
+        let apart = diff(got.px(), &case.crop);
+        println!("roll {:>6.2}  centre ({:.1}, {:.1})  {apart}", case.roll, case.cx, case.cy);
+        assert!(apart.worst <= 1, "{apart} - not fixed-point noise");
+        assert!(apart.mean <= 0.01, "{apart} - the whole crop has drifted");
     }
 }
 
@@ -136,9 +193,9 @@ fn python_box_path_is_a_different_resampler() {
     let cases: Vec<&Case> = g.cases.iter().filter(|c| c.crop_box.is_some()).collect();
     assert!(!cases.is_empty(), "no case exercises data.crop_at's roll==0 branch");
     for case in cases {
-        let (max, mean) = diff(case.crop_box.as_ref().unwrap(), &case.crop);
-        println!("box vs warp at roll 0: max |d| {max}  mean |d| {mean:.4}");
-        assert!(max > 10, "the two Python paths now agree to {max} grey levels");
+        let apart = diff(case.crop_box.as_ref().unwrap(), &case.crop);
+        println!("box vs warp at roll 0: {apart}");
+        assert!(apart.worst > 10, "the two Python paths now agree to {apart}");
     }
 }
 

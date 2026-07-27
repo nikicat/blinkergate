@@ -10,6 +10,10 @@ blinkergate-proto = { path = "../proto" }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 toml = "0.9"
+v4l = "0.14"
+mediapipe = "0.1"
+getrandom = "0.4"
+rustix = { version = "1", default-features = false, features = ["net", "process", "std"] }
 thiserror = "2"
 
 [dev-dependencies]
