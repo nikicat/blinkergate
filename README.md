@@ -15,6 +15,11 @@ detection layer that has to work first.
 > this hardware — frame rate, detector thresholds, what the classifier is brittle
 > to. The second is the mistakes that produced confident wrong answers along the
 > way, most of which are easy to repeat.
+>
+> [docs/GATE.md](docs/GATE.md) is the design and running state of `rust/` — the
+> daemon and PAM module that turn a gesture into a `run0` authentication. It
+> carries what has been verified, what has not, and which decisions were taken
+> deliberately.
 
 ## Why enrol instead of shipping a model
 
