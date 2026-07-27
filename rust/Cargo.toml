@@ -1,0 +1,13 @@
+[workspace]
+members = ["proto", "gate"]
+resolver = "3"
+
+[workspace.package]
+version = "0.1.0"
+edition = "2024"
+license = "Apache-2.0"
+
+# Debug symbols but optimised: the whole point of the daemon is to fit a frame
+# inside the 133ms the strobe allows, and a debug build does not.
+[profile.release]
+debug = 1

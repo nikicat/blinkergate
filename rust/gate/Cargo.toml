@@ -1,0 +1,15 @@
+[package]
+name = "blinkergate"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Eye-gesture consent daemon: camera, classifier, gesture matcher"
+
+[dependencies]
+blinkergate-proto = { path = "../proto" }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+toml = "0.9"
+thiserror = "2"
+
+[dev-dependencies]

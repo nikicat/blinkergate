@@ -1,0 +1,16 @@
+[package]
+name = "blinkergate-proto"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Wire protocol between pam_blinkergate.so and blinkergated"
+
+# One dependency, and the bar for a second is high: this is what the PAM module
+# links, and the PAM module is loaded into setuid polkit-agent-helper-1, where a
+# crate that prints a banner to stdout corrupts the helper's wire protocol and a
+# crate that panics unwinds across an FFI boundary.
+#
+# getrandom clears that bar - it is the `getrandom(2)` syscall and nothing else,
+# with no allocation, no file descriptor and no output.
+[dependencies]
+getrandom = "0.4"

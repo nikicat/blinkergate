@@ -13,4 +13,9 @@ venv/
 
 # Model generations: derived from your face data, keep local.
 models/
+# The exported model, likewise: it IS the weights, in a different file format.
+/model.json
 face_detection_yunet.onnx
+
+# Rust build tree.
+rust/target/
