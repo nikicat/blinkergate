@@ -389,8 +389,15 @@ MEDIAPIPE_LIB=$PWD/../.venv/lib/python3.13/site-packages/mediapipe/tasks/c/libme
 ./target/debug/bgatectl check ../model.json                # would the daemon run it?
 ```
 
-`MEDIAPIPE_LIB` avoids the `mediapipe` crate downloading its own 34MB copy; the
-packaged daemon will need the same variable set in its unit.
+`MEDIAPIPE_LIB` avoids the `mediapipe` crate downloading its own 34MB copy, and the
+packaged daemon needs the same variable set in its unit - not to save the download,
+but because of where the crate looks when it is unset. The search is
+`$MEDIAPIPE_LIB`, `$XDG_CACHE_HOME`, `$HOME/.cache`, then `std::env::temp_dir()`,
+and a system unit with no `User=` has none of the first three. So a root daemon
+would `dlopen` `/tmp/mediapipe-rs/<version>/libmediapipe.so` - whoever wrote it -
+and `dlopen` runs an object's initialisers. The crate pins a SHA-256, but checks it
+on the download path only, never on a cache hit. `PrivateTmp=yes` makes forgetting
+the variable survivable rather than fatal.
 
 `bgatectl` exit codes: 0 confirmed, 1 denied (it ran, the answer was no), 2 could
 not ask.
@@ -415,8 +422,13 @@ the rest to be *run* without a password prompt.
    unit carrying the helper's sandbox settings. This is the plan's one explicitly
    unverified assumption and the thing that broke Howdy on polkit 127.
 4. **Enrolment and packaging** - `blinkergate-enroll`, the systemd unit (with
-   `RuntimeDirectory=blinkergate` and `MEDIAPIPE_LIB`), `/etc/blinkergate/config.toml`,
-   and where `libmediapipe.so` and `face_landmarker.task` live.
+   `RuntimeDirectory=blinkergate`, `MEDIAPIPE_LIB` and `PrivateTmp=yes`),
+   `/etc/blinkergate/config.toml`, and where `libmediapipe.so` and
+   `face_landmarker.task` live. Enrolment creates `/var/lib/blinkergate/<uid>/`,
+   which must be `0755 root:root`: `trust::root_owned` refuses a file anyone else
+   owns, but it stats a path and then opens it, so a user who can write the
+   directory can swap a root-owned `model.json` for a link to their own between the
+   two.
 5. **Steps 4 to 8 on the real machine** - these need hands: performing an actual
    gesture at the camera, editing `/etc/pam.d/polkit-1` with a root shell held
    open, and the `auth_admin` vs `auth_admin_keep` decision, which is a policy

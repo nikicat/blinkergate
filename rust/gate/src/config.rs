@@ -92,9 +92,16 @@ pub struct Config {
 #[derive(Debug, Clone, Default, Deserialize)]
 #[serde(deny_unknown_fields, default)]
 pub struct ReplayConfig {
-    /// When set, the camera is not opened at all. Root-owned like everything else the
-    /// gate trusts: a directory of frames the user can write is a recording of
-    /// whatever gesture they like.
+    /// When set, the camera is not opened at all.
+    ///
+    /// Deliberately *not* checked for ownership, unlike the model and the config: the
+    /// frames are recorded by hand on the host and replayed in the e2e guest, so they
+    /// are the user's own by construction and [`read_root_owned`] would refuse the one
+    /// case this exists for. What keeps that from being a way in is the config itself,
+    /// which only root can write - a real gate never has this set, and a recording is
+    /// evidence about the plumbing rather than about a face.
+    ///
+    /// [`read_root_owned`]: crate::trust::read_root_owned
     ///
     /// The rate is *not* configured here - it is in the recording's own `replay.toml`,
     /// because replaying frames faster than they were recorded changes a held closure
